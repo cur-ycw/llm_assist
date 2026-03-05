@@ -1,0 +1,23 @@
+# 大体积子项目（若需单独管理请用 submodule）
+SemDiv/pymarl
+SemDiv/HARL
+SemDiv/football
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.so
+.Python
+.env
+.venv/
+venv/
+
+# 结果与缓存
+*.npy
+rollout_results/
+lib/
+
+# IDE
+.vscode/
