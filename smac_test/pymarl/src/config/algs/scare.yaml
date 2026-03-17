@@ -1,0 +1,45 @@
+# --- SCARE specific parameters ---
+
+# use epsilon greedy action selector
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "parallel"
+batch_size_run: 64
+
+buffer_size: 5000
+
+# update the target network every {} episodes
+target_update_interval: 200
+
+# use the SCARE learner
+agent_output_type: "q"
+agent: "scare"
+learner: "scare_learner"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+# --- SCARE architecture ---
+n_encoders: 4
+enc_feature_dim: 64
+selector_hidden_dim: 64
+selector_lr: 0.0005
+
+# --- Prior loss decay (lambda) ---
+lambda_prior_start: 1.0
+lambda_prior_finish: 0.01
+lambda_prior_anneal: 200000
+
+# --- SCARE pretrain library ---
+scare_lib_dir: ""  # 预训练产出目录，如 "scare_lib/2025-01-01_00-00-00_scare"
+
+# --- Enable model saving ---
+save_model: True
+save_model_interval: 100000
+
+name: "scare"
