@@ -39,6 +39,10 @@ class ParallelRunner:
         self.test_stats = {}
 
         self.log_train_stats_t = -100000
+        self.last_train_return_mean = 0.0
+        self.last_test_return_mean = 0.0
+        self.last_train_win_rate = 0.0
+        self.last_test_win_rate = 0.0
 
     def setup(self, scheme, groups, preprocess, mac):
         self.new_batch = partial(EpisodeBatch, scheme, groups, self.batch_size, self.episode_limit + 1,
@@ -200,8 +204,20 @@ class ParallelRunner:
         return self.batch
 
     def _log(self, returns, stats, prefix):
-        self.logger.log_stat(prefix + "return_mean", np.mean(returns), self.t_env)
+        return_mean = np.mean(returns)
+        self.logger.log_stat(prefix + "return_mean", return_mean, self.t_env)
         self.logger.log_stat(prefix + "return_std", np.std(returns), self.t_env)
+        if prefix == "test_":
+            self.last_test_return_mean = float(return_mean)
+        else:
+            self.last_train_return_mean = float(return_mean)
+        win_rate = 0.0
+        if stats.get("n_episodes", 0) > 0 and "battle_won" in stats:
+            win_rate = float(stats["battle_won"] / stats["n_episodes"])
+        if prefix == "test_":
+            self.last_test_win_rate = win_rate
+        else:
+            self.last_train_win_rate = win_rate
         returns.clear()
 
         for k, v in stats.items():

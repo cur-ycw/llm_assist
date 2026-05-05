@@ -18,6 +18,11 @@ buffer_cpu_only: True
 
 # --- Logging options ---
 use_tensorboard: True
+use_wandb: False
+wandb_project: "pymarl"
+wandb_entity: null
+wandb_group: null
+wandb_tags: null
 save_model: False
 save_model_interval: 2000000
 checkpoint_path: ""

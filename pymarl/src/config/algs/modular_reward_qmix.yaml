@@ -1,0 +1,109 @@
+# --- Modular reward agent on top of QMIX ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "episode"
+
+buffer_size: 5000
+batch_size: 32
+
+target_update_interval: 200
+
+test_nepisode: 32
+test_interval: 10000
+log_interval: 10000
+runner_log_interval: 10000
+learner_log_interval: 10000
+
+agent_output_type: "q"
+learner: "modular_reward_learner"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+modular_reward_use_llm_init: True
+modular_reward_llm_model: "gpt-4o"
+modular_reward_llm_temperature: 0.2
+modular_reward_llm_base_url: "https://api.chatanywhere.tech/v1/chat/completions"
+modular_reward_llm_timeout: 60
+modular_reward_llm_key_source: "/root/ycw/human_aicoord/SemDiv/language/call_llm.py"
+
+modular_reward_beta: 0.3
+modular_reward_beta_start: 0.1
+modular_reward_beta_end: 0.3
+modular_reward_beta_ramp_start_steps: 100000
+modular_reward_beta_ramp_steps: 600000
+modular_reward_guidance_start_steps: 100000
+modular_reward_guidance_ramp_steps: 250000
+modular_reward_min_beta_ratio: 0.1
+modular_reward_module_budget: 6
+modular_reward_selector_hidden_dim: 64
+modular_reward_selector_lr: 0.0005
+modular_reward_selector_temperature: 1.0
+modular_reward_selector_entropy_coef: 0.01
+modular_reward_selector_smoothing_coef: 0.02
+modular_reward_selector_advantage_coef: 0.05
+modular_reward_selector_balance_coef: 0.01
+modular_reward_selector_activation_threshold: 0.35
+modular_reward_check_interval: 400
+modular_reward_warmup_steps: 200000
+modular_reward_module_update_interval: 200000
+modular_reward_enable_lifecycle: True
+modular_reward_use_llm_generation: True
+modular_reward_enable_ivf: False
+modular_reward_promote_threshold: 0.0
+modular_reward_rollback_threshold: -0.02
+modular_reward_module_cooldown: 200000
+modular_reward_candidate_shadow_scale: 0.25
+modular_reward_transition_steps: 50000
+modular_reward_transition_loss_coef: 0.05
+modular_reward_selector_viz_interval: 10000
+modular_reward_shaping_delta_clip: 0.5
+modular_reward_improving_min_return_gain: 0.05
+modular_reward_improving_min_win_rate_gain: 0.01
+modular_reward_structural_bias_balance_threshold: 0.02
+modular_reward_structural_bias_entropy_threshold: 1.1
+modular_reward_structural_bias_usage_gap_threshold: 0.35
+modular_reward_allow_same_family_replacement: False
+modular_reward_max_modules_per_family: 2
+modular_reward_low_usage_threshold: 0.12
+modular_reward_low_contribution_threshold: 0.0
+modular_reward_low_activation_threshold: 0.1
+modular_reward_stagnation_min_return_delta: 0.02
+modular_reward_stagnation_min_win_rate_delta: 0.01
+modular_reward_stagnation_max_entropy_delta: 0.02
+modular_reward_collapse_entropy_threshold: 0.9
+modular_reward_collapse_switch_threshold: 0.08
+modular_reward_relative_usage_ceiling: 0.28
+modular_reward_relative_activation_ceiling: 0.25
+modular_reward_relative_contribution_margin: 0.01
+modular_reward_module_scale_step: 0.05
+modular_reward_module_min_scale: 0.05
+modular_reward_module_max_scale: 2.0
+modular_reward_negative_contribution_threshold: -0.01
+modular_reward_positive_contribution_threshold: 0.01
+modular_reward_force_selector_mode: null
+modular_reward_use_outer_loop_selector: False
+modular_reward_outer_selector_mix_coef: 0.5
+modular_reward_outer_selector_interval: 400
+modular_reward_outer_selector_hidden_dim: 64
+modular_reward_outer_selector_lr: 0.0005
+modular_reward_outer_selector_entropy_coef: 0.01
+modular_reward_outer_selector_value_coef: 0.5
+modular_reward_outer_selector_min_alpha: 0.3
+modular_reward_outer_selector_return_scale: 20.0
+modular_reward_refinement_interval: 200000
+modular_reward_use_llm_refinement: False
+modular_reward_ivf_lr: 0.001
+modular_reward_ivf_gamma: 0.5
+modular_reward_ivf_epsilon_start: 0.5
+modular_reward_ivf_epsilon_end: 0.1
+modular_reward_ivf_epsilon_decay: 120
+modular_reward_attack_action_start: 6
+
+name: "modular_reward_qmix"

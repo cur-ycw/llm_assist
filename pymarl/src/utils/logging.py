@@ -1,5 +1,6 @@
 from collections import defaultdict
 import logging
+import os
 import numpy as np
 
 def _to_scalar(x):
@@ -17,6 +18,7 @@ class Logger:
         self.use_tb = False
         self.use_sacred = False
         self.use_hdf = False
+        self.use_wandb = False
 
         self.stats = defaultdict(lambda: [])
 
@@ -36,6 +38,39 @@ class Logger:
         """TensorBoard 写入结束（tensorboard-logger 无显式关闭，保留接口兼容）。"""
         pass
 
+    def setup_wandb(self, project, run_name, config=None, entity=None, group=None, tags=None):
+        try:
+            import wandb
+            mode = os.environ.get("WANDB_MODE", "online")
+            init_timeout = int(os.environ.get("WANDB_INIT_TIMEOUT", "180"))
+            start_method = os.environ.get("WANDB_START_METHOD", "thread")
+            wandb.init(
+                project=project,
+                name=run_name,
+                config=config,
+                entity=entity,
+                group=group,
+                tags=tags,
+                mode=mode,
+                reinit=True,
+                settings=wandb.Settings(init_timeout=init_timeout, start_method=start_method),
+            )
+            self.wandb = wandb
+            self.use_wandb = True
+        except ImportError:
+            self.console_logger.warning(
+                "wandb 未安装，无法记录到 Weights & Biases。请安装: pip install wandb"
+            )
+        except Exception as exc:
+            self.console_logger.warning("Weights & Biases 初始化失败: {}".format(exc))
+
+    def close_wandb(self):
+        if self.use_wandb and getattr(self, "wandb", None) is not None:
+            try:
+                self.wandb.finish()
+            except Exception:
+                pass
+
     def setup_sacred(self, sacred_run_dict):
         self.sacred_info = sacred_run_dict.info
         self.use_sacred = True
@@ -48,6 +83,12 @@ class Logger:
                 v = _to_scalar(value)
                 step = int(_to_scalar(t))
                 self.tb_logger(key, v, step)
+            except Exception:
+                pass
+
+        if self.use_wandb and getattr(self, "wandb", None) is not None:
+            try:
+                self.wandb.log({key: _to_scalar(value), "trainer_step": int(_to_scalar(t))}, step=int(_to_scalar(t)))
             except Exception:
                 pass
 

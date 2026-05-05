@@ -41,6 +41,15 @@ def run(_run, _config, _log):
         os.makedirs(tb_root, exist_ok=True)
         tb_exp_direc = os.path.join(tb_root, "{}").format(unique_token)
         logger.setup_tb(tb_exp_direc)
+    if getattr(args, "use_wandb", False):
+        logger.setup_wandb(
+            project=getattr(args, "wandb_project", "pymarl"),
+            run_name=unique_token,
+            config=_config,
+            entity=getattr(args, "wandb_entity", None),
+            group=getattr(args, "wandb_group", None),
+            tags=getattr(args, "wandb_tags", None),
+        )
 
     # sacred is on by default
     logger.setup_sacred(_run)
@@ -158,33 +167,52 @@ def run_sequential(args, logger):
 
     start_time = time.time()
     last_time = start_time
+    last_tracked_t_env = 0
     _logged_train_device = False
+    _collect_time = 0.0
+    _train_time = 0.0
+    _loop_count = 0
 
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
 
     while runner.t_env <= args.t_max:
 
-        # Run for a whole episode at a time
+        collect_start = time.time()
         episode_batch = runner.run(test_mode=False)
         buffer.insert_episode_batch(episode_batch)
+        _collect_time += time.time() - collect_start
+
+        if hasattr(learner, "state_tracker") and hasattr(learner.state_tracker, "tick"):
+            tick_steps = max(runner.t_env - last_tracked_t_env, 0)
+            learner.state_tracker.tick(tick_steps)
+            last_tracked_t_env = runner.t_env
 
         if buffer.can_sample(args.batch_size):
-            episode_sample = buffer.sample(args.batch_size)
+            train_start = time.time()
+            n_train = getattr(args, "training_iters", 1)
+            for _ in range(n_train):
+                episode_sample = buffer.sample(args.batch_size)
 
-            # Truncate batch to only filled timesteps
-            max_ep_t = episode_sample.max_t_filled()
-            episode_sample = episode_sample[:, :max_ep_t]
+                # Truncate batch to only filled timesteps
+                max_ep_t = episode_sample.max_t_filled()
+                episode_sample = episode_sample[:, :max_ep_t]
 
-            if episode_sample.device != args.device:
-                episode_sample.to(args.device)
+                if episode_sample.device != args.device:
+                    episode_sample.to(args.device)
 
-            if not _logged_train_device and args.use_cuda:
-                _dev = next(learner.mac.parameters()).device
-                _batch_dev = episode_sample.data.transition_data["state"].device
-                logger.console_logger.info("Train device check: model on {}, batch on {} (expect cuda for both)".format(_dev, _batch_dev))
-                _logged_train_device = True
+                if not _logged_train_device and args.use_cuda:
+                    _dev = next(learner.mac.parameters()).device
+                    _batch_dev = episode_sample.data.transition_data["state"].device
+                    logger.console_logger.info("Train device check: model on {}, batch on {} (expect cuda for both)".format(_dev, _batch_dev))
+                    _logged_train_device = True
 
-            learner.train(episode_sample, runner.t_env, episode)
+                learner.train(episode_sample, runner.t_env, episode)
+            _train_time += time.time() - train_start
+
+        _loop_count += 1
+
+        if hasattr(learner, "maybe_ivf_decide"):
+            learner.maybe_ivf_decide(episode, runner.t_env)
 
         # Execute test runs once in a while
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
@@ -193,11 +221,29 @@ def run_sequential(args, logger):
             logger.console_logger.info("t_env: {} / {}".format(runner.t_env, args.t_max))
             logger.console_logger.info("Estimated time left: {}. Time passed: {}".format(
                 time_left(last_time, last_test_T, runner.t_env, args.t_max), time_str(time.time() - start_time)))
+            total_profile = _collect_time + _train_time
+            if total_profile > 0:
+                logger.console_logger.info(
+                    "Time breakdown | collect: {:.1f}s ({:.0f}%) | train(x{}): {:.1f}s ({:.0f}%) | loops: {}".format(
+                        _collect_time,
+                        100 * _collect_time / total_profile,
+                        getattr(args, "training_iters", 1),
+                        _train_time,
+                        100 * _train_time / total_profile,
+                        _loop_count,
+                    )
+                )
             last_time = time.time()
 
             last_test_T = runner.t_env
             for _ in range(n_test_runs):
                 runner.run(test_mode=True)
+            if hasattr(learner, "set_test_return"):
+                learner.set_test_return(getattr(runner, "last_test_return_mean", 0.0))
+            if hasattr(learner, "update_win_stat"):
+                learner.update_win_stat(getattr(runner, "last_test_win_rate", 0.0))
+            if hasattr(learner, "maybe_refine_modules"):
+                learner.maybe_refine_modules(runner.t_env)
 
         if args.save_model and (runner.t_env - model_save_time >= args.save_model_interval or model_save_time == 0):
             model_save_time = runner.t_env
@@ -217,6 +263,8 @@ def run_sequential(args, logger):
     runner.close_env()
     if getattr(logger, "use_tb", False):
         logger.close_tb()
+    if getattr(logger, "use_wandb", False):
+        logger.close_wandb()
     logger.console_logger.info("Finished Training")
 
 
