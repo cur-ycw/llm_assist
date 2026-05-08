@@ -205,6 +205,11 @@ class ModularRewardModulePool:
         self.feedback_window_history = []
         self.last_transition_progress = 1.0
         self.compiled_module_functions = {}
+        uniform_prior = 1.0 / max(len(self.module_specs), 1)
+        self.last_module_env_credit = {spec["id"]: 0.0 for spec in self.module_specs}
+        self.last_module_trust = {spec["id"]: 0.0 for spec in self.module_specs}
+        self.last_module_trust_prior = {spec["id"]: uniform_prior for spec in self.module_specs}
+        self.last_env_feedback_signal = 0.0
         self._refresh_module_cache()
         self.last_module_usage = {spec["id"]: 0.0 for spec in self.module_specs}
         self.last_module_scores = {spec["id"]: 0.0 for spec in self.module_specs}
@@ -230,31 +235,31 @@ class ModularRewardModulePool:
             },
             {
                 "name": "attack_commitment",
-                "scale": 0.8,
+                "scale": 1.0,
                 "description": BUILTIN_MODULE_LIBRARY["attack_commitment"]["description"],
                 "when_to_use": BUILTIN_MODULE_LIBRARY["attack_commitment"]["when_to_use"],
             },
             {
                 "name": "coordinated_advance",
-                "scale": 0.5,
+                "scale": 1.0,
                 "description": BUILTIN_MODULE_LIBRARY["coordinated_advance"]["description"],
                 "when_to_use": BUILTIN_MODULE_LIBRARY["coordinated_advance"]["when_to_use"],
             },
             {
                 "name": "target_persistence",
-                "scale": 0.4,
+                "scale": 1.0,
                 "description": BUILTIN_MODULE_LIBRARY["target_persistence"]["description"],
                 "when_to_use": BUILTIN_MODULE_LIBRARY["target_persistence"]["when_to_use"],
             },
             {
                 "name": "action_variation",
-                "scale": 0.7,
+                "scale": 1.0,
                 "description": BUILTIN_MODULE_LIBRARY["action_variation"]["description"],
                 "when_to_use": BUILTIN_MODULE_LIBRARY["action_variation"]["when_to_use"],
             },
             {
                 "name": "team_attack_balance",
-                "scale": 0.9,
+                "scale": 1.0,
                 "description": BUILTIN_MODULE_LIBRARY["team_attack_balance"]["description"],
                 "when_to_use": BUILTIN_MODULE_LIBRARY["team_attack_balance"]["when_to_use"],
             },
@@ -303,7 +308,12 @@ class ModularRewardModulePool:
     def _normalise_spec(self, spec: Dict, index: int) -> Dict:
         module_name = str(spec["name"])
         builtin = BUILTIN_MODULE_LIBRARY.get(module_name, {})
-        scale = max(0.0, min(float(spec.get("scale", 1.0)), 2.0))
+        scale = spec.get("scale", 1.0)
+        try:
+            scale = float(scale)
+        except Exception:
+            scale = 1.0
+        scale = max(0.0, min(scale, 2.0))
         source_type = str(spec.get("source_type", "builtin" if module_name in BUILTIN_MODULE_LIBRARY else "generated"))
         python_function_source = str(spec.get("python_function_source", builtin.get("python_function_source", "")))
         required_inputs = spec.get("required_inputs", [])
@@ -388,6 +398,10 @@ class ModularRewardModulePool:
         payload["module_window_history"] = deepcopy(self.module_window_history)
         payload["feedback_window_history"] = deepcopy(self.feedback_window_history)
         payload["last_trigger_decision"] = deepcopy(self.last_trigger_decision)
+        payload["module_env_credit"] = deepcopy(self.last_module_env_credit)
+        payload["module_trust"] = deepcopy(self.last_module_trust)
+        payload["module_trust_prior"] = deepcopy(self.last_module_trust_prior)
+        payload["env_feedback_signal"] = float(self.last_env_feedback_signal)
         payload["rejected_initial_modules"] = deepcopy(self.spec_bundle.get("rejected_initial_modules", []))
         save_path = os.path.join(base_dir, "{}.json".format(unique_token))
         with open(save_path, "w", encoding="utf-8") as handle:
@@ -418,6 +432,11 @@ class ModularRewardModulePool:
             "source": source,
             "t_env": int(t_env),
         }]
+
+    def get_trust_prior_tensor(self, device=None) -> th.Tensor:
+        values = [float(self.last_module_trust_prior.get(spec["id"], 1.0 / max(len(self.module_specs), 1))) for spec in self.module_specs]
+        tensor = th.tensor(values, dtype=th.float32, device=device)
+        return tensor / tensor.sum().clamp(min=1e-8)
 
     def get_specs_payload(self):
         return {
@@ -460,6 +479,10 @@ class ModularRewardModulePool:
             "module_status_code": dict(self.last_module_status_code),
             "module_scale": dict(self.last_module_scale),
             "module_transition_alpha": dict(self.last_transition_alpha),
+            "module_env_credit": dict(self.last_module_env_credit),
+            "module_trust": dict(self.last_module_trust),
+            "module_trust_prior": dict(self.last_module_trust_prior),
+            "env_feedback_signal": float(self.last_env_feedback_signal),
             "transition_progress": float(self.last_transition_progress),
             "pending_update": deepcopy(self.pending_update),
             "last_update_events": deepcopy(self.last_update_events),
@@ -470,6 +493,104 @@ class ModularRewardModulePool:
 
     def get_active_modules(self) -> List[Dict]:
         return [spec for spec in self.module_specs if spec["status"] in ("active", "candidate")]
+
+    def update_env_feedback_trust(self, feedback_payload: Dict, t_env: int) -> Dict:
+        uniform_prior = 1.0 / max(len(self.module_specs), 1)
+        if len(self.feedback_window_history) < 2:
+            self.last_env_feedback_signal = 0.0
+            self.last_module_env_credit = {spec["id"]: 0.0 for spec in self.module_specs}
+            self.last_module_trust_prior = {spec["id"]: uniform_prior for spec in self.module_specs}
+            return {
+                "signal": 0.0,
+                "prior": [uniform_prior for _ in self.module_specs],
+                "trust": dict(self.last_module_trust),
+                "credit": dict(self.last_module_env_credit),
+            }
+
+        previous_feedback = self.feedback_window_history[-2]
+        latest_feedback = self.feedback_window_history[-1]
+        return_delta = float(latest_feedback.get("latest_test_return", 0.0)) - float(previous_feedback.get("latest_test_return", 0.0))
+        win_rate_delta = float(latest_feedback.get("latest_test_win_rate", 0.0)) - float(previous_feedback.get("latest_test_win_rate", 0.0))
+        return_scale = max(float(getattr(self.args, "modular_reward_env_trust_return_scale", 2.0)), 1e-6)
+        win_rate_scale = max(float(getattr(self.args, "modular_reward_env_trust_win_scale", 0.05)), 1e-6)
+        ema = min(max(float(getattr(self.args, "modular_reward_env_trust_ema", 0.2)), 0.0), 1.0)
+        trust_logit_scale = float(getattr(self.args, "modular_reward_env_trust_logit_scale", 6.0))
+        usage_coef = float(getattr(self.args, "modular_reward_env_trust_usage_coef", 0.7))
+        activation_coef = float(getattr(self.args, "modular_reward_env_trust_activation_coef", 0.3))
+
+        return_signal = max(min(return_delta / return_scale, 1.0), -1.0)
+        win_signal = max(min(win_rate_delta / win_rate_scale, 1.0), -1.0)
+        env_signal = 0.7 * return_signal + 0.3 * win_signal
+        self.last_env_feedback_signal = float(env_signal)
+
+        active_specs = [spec for spec in self.module_specs if spec.get("status") == "active"]
+        latest_windows = []
+        for spec in active_specs:
+            history = self.module_window_history.get(spec["id"], [])
+            if not history:
+                continue
+            latest_windows.append((spec, history[-1]))
+
+        if not latest_windows:
+            self.last_module_env_credit = {spec["id"]: 0.0 for spec in self.module_specs}
+            self.last_module_trust_prior = {spec["id"]: uniform_prior for spec in self.module_specs}
+            return {
+                "signal": float(env_signal),
+                "prior": [uniform_prior for _ in self.module_specs],
+                "trust": dict(self.last_module_trust),
+                "credit": dict(self.last_module_env_credit),
+            }
+
+        activities = {}
+        for spec, window in latest_windows:
+            usage = float(window.get("usage", 0.0))
+            activation = float(window.get("activation", 0.0))
+            contribution = float(window.get("contribution", 0.0))
+            weighted_score = float(window.get("weighted_score", 0.0))
+            activities[spec["id"]] = (
+                usage_coef * usage
+                + activation_coef * activation
+                + 0.35 * contribution
+                + 0.20 * weighted_score
+            )
+        activity_values = list(activities.values())
+        mean_activity = sum(activity_values) / max(len(activity_values), 1)
+        variance = sum((value - mean_activity) ** 2 for value in activity_values) / max(len(activity_values), 1)
+        std_activity = math.sqrt(max(variance, 1e-8))
+
+        updated_credit = {spec["id"]: 0.0 for spec in self.module_specs}
+        updated_trust = dict(self.last_module_trust)
+        for spec in self.module_specs:
+            module_id = spec["id"]
+            centered_activity = activities.get(module_id, mean_activity) - mean_activity
+            normalized_activity = centered_activity / max(std_activity, 1e-4)
+            credit = normalized_activity * env_signal
+            updated_credit[module_id] = float(credit)
+            previous_trust = float(updated_trust.get(module_id, 0.0))
+            updated_trust[module_id] = (1.0 - ema) * previous_trust + ema * float(credit)
+
+        trust_values = [float(updated_trust.get(spec["id"], 0.0)) for spec in self.module_specs]
+        trust_tensor = th.tensor(trust_values, dtype=th.float32)
+        trust_mean = float(trust_tensor.mean().item())
+        trust_std = float(trust_tensor.std(unbiased=False).item())
+        trust_scale = max(trust_std, 0.05)
+        trust_logits = ((trust_tensor - trust_mean) / trust_scale) * trust_logit_scale
+        trust_prior = th.softmax(trust_logits, dim=0).tolist()
+
+        self.last_module_env_credit = updated_credit
+        self.last_module_trust = updated_trust
+        self.last_module_trust_prior = {
+            spec["id"]: float(trust_prior[index]) for index, spec in enumerate(self.module_specs)
+        }
+        self._sync_runtime_metadata()
+        return {
+            "signal": float(env_signal),
+            "prior": [float(v) for v in trust_prior],
+            "trust": dict(self.last_module_trust),
+            "credit": dict(self.last_module_env_credit),
+            "return_delta": float(return_delta),
+            "win_rate_delta": float(win_rate_delta),
+        }
 
     def _build_features(self, actions: th.Tensor, avail_actions: th.Tensor) -> Dict[str, th.Tensor]:
         action_ids = actions.squeeze(-1).long()
@@ -766,9 +887,9 @@ class ModularRewardModulePool:
 
     def _selector_structurally_biased(self) -> bool:
         required_windows = int(getattr(self.args, "modular_reward_low_signal_windows", 3))
-        balance_threshold = float(getattr(self.args, "modular_reward_structural_bias_balance_threshold", 0.02))
-        entropy_threshold = float(getattr(self.args, "modular_reward_structural_bias_entropy_threshold", 1.1))
-        usage_gap_threshold = float(getattr(self.args, "modular_reward_structural_bias_usage_gap_threshold", 0.35))
+        balance_threshold = float(getattr(self.args, "modular_reward_structural_bias_balance_threshold", 0.008))
+        entropy_threshold = float(getattr(self.args, "modular_reward_structural_bias_entropy_threshold", 1.35))
+        usage_gap_threshold = float(getattr(self.args, "modular_reward_structural_bias_usage_gap_threshold", 0.18))
         history = self.feedback_window_history
         if len(history) < required_windows:
             return False
@@ -842,6 +963,30 @@ class ModularRewardModulePool:
         candidates.sort(key=lambda item: item[0], reverse=True)
         return candidates[0][1]
 
+    def _persistent_bad_module_target(self, t_env: int) -> Optional[Dict]:
+        required_windows = int(getattr(self.args, "modular_reward_low_signal_windows", 3))
+        trust_threshold = float(getattr(self.args, "modular_reward_bad_trust_threshold", -0.03))
+        credit_threshold = float(getattr(self.args, "modular_reward_bad_credit_threshold", -0.01))
+        candidates = []
+        for spec in self.module_specs:
+            if spec.get("status") != "active":
+                continue
+            if t_env < int(spec.get("cooldown_until", 0)):
+                continue
+            history = self.module_window_history.get(spec["id"], [])
+            if len(history) < required_windows:
+                continue
+            recent = history[-required_windows:]
+            mean_trust = float(self.last_module_trust.get(spec["id"], 0.0))
+            mean_credit = float(self.last_module_env_credit.get(spec["id"], 0.0))
+            if mean_trust <= trust_threshold and mean_credit <= credit_threshold and all(float(item.get("contribution", 0.0)) <= float(getattr(self.args, "modular_reward_low_contribution_threshold", 0.005)) for item in recent):
+                severity = (trust_threshold - mean_trust) + (credit_threshold - mean_credit)
+                candidates.append((severity, spec))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
     def _choose_update_target(self, t_env: int) -> Tuple[Optional[Dict], Dict]:
         absolute_target = self._low_signal_target(t_env)
         if absolute_target is not None:
@@ -852,6 +997,19 @@ class ModularRewardModulePool:
                 "collapse": False,
                 "improving": False,
                 "structural_bias": False,
+                "persistent_bad": False,
+            }
+
+        persistent_bad_target = self._persistent_bad_module_target(t_env)
+        if persistent_bad_target is not None:
+            return persistent_bad_target, {
+                "mode": "persistent_bad_module",
+                "t_env": int(t_env),
+                "stagnant": False,
+                "collapse": False,
+                "improving": False,
+                "structural_bias": False,
+                "persistent_bad": True,
             }
 
         stagnant = self._is_training_stagnant()
@@ -868,6 +1026,7 @@ class ModularRewardModulePool:
                     "collapse": bool(collapse),
                     "improving": bool(improving),
                     "structural_bias": bool(structural_bias),
+                    "persistent_bad": False,
                 }
 
         if improving and structural_bias:
@@ -880,6 +1039,7 @@ class ModularRewardModulePool:
                     "collapse": bool(collapse),
                     "improving": bool(improving),
                     "structural_bias": bool(structural_bias),
+                    "persistent_bad": False,
                 }
 
         return None, {
@@ -889,12 +1049,13 @@ class ModularRewardModulePool:
             "collapse": bool(collapse),
             "improving": bool(improving),
             "structural_bias": bool(structural_bias),
+            "persistent_bad": False,
         }
 
     def _low_signal_target(self, t_env: int) -> Optional[Dict]:
         required_windows = int(getattr(self.args, "modular_reward_low_signal_windows", 3))
         usage_threshold = float(getattr(self.args, "modular_reward_low_usage_threshold", 0.12))
-        contribution_threshold = float(getattr(self.args, "modular_reward_low_contribution_threshold", 0.0))
+        contribution_threshold = float(getattr(self.args, "modular_reward_low_contribution_threshold", 0.005))
         activation_threshold = float(getattr(self.args, "modular_reward_low_activation_threshold", 0.1))
 
         candidates = []
@@ -1210,3 +1371,15 @@ class ModularRewardModulePool:
         self.last_module_status_code = {spec["id"]: STATUS_TO_CODE.get(spec["status"], 0.0) for spec in self.module_specs}
         self.last_module_scale = {spec["id"]: float(spec["scale"]) for spec in self.module_specs}
         self.last_transition_alpha = {spec["id"]: float(spec.get("transition_alpha", 1.0)) for spec in self.module_specs}
+        if not hasattr(self, "last_module_env_credit"):
+            self.last_module_env_credit = {}
+        if not hasattr(self, "last_module_trust"):
+            self.last_module_trust = {}
+        if not hasattr(self, "last_module_trust_prior"):
+            self.last_module_trust_prior = {}
+        for spec in self.module_specs:
+            self.last_module_env_credit.setdefault(spec["id"], 0.0)
+            self.last_module_trust.setdefault(spec["id"], 0.0)
+        if not self.last_module_trust_prior:
+            uniform_prior = 1.0 / max(len(self.module_specs), 1)
+            self.last_module_trust_prior = {spec["id"]: uniform_prior for spec in self.module_specs}

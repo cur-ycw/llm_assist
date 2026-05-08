@@ -152,7 +152,7 @@ class ModularRewardLLMInitializer:
             "Task: generate a small executable pool of auxiliary reward modules for sparse/delayed team rewards.",
             "Do not just pick from a catalog; generate the actual reward module implementations.",
             "Return JSON with this schema:",
-            '{"modules": [{"name": "module_name", "scale": 0.0_to_2.0, "description": "short text", "when_to_use": "short text", "required_inputs": ["..."], "hypothesis": "short text", "expected_effect": "short text", "python_function_source": "def compute_reward_module(features, tensors):\\n    ..."}]}',
+            '{"modules": [{"name": "module_name", "description": "short text", "when_to_use": "short text", "required_inputs": ["..."], "hypothesis": "short text", "expected_effect": "short text", "python_function_source": "def compute_reward_module(features, tensors):\\n    ..."}]}',
             "Return exactly {} modules unless the interface constraints make one impossible.".format(module_budget),
             "Each module must belong to a meaningfully different behaviour family; avoid near-duplicates that only rename the same heuristic.",
             "Prefer coverage across distinct coordination roles such as: focus fire, attack commitment, target persistence / handoff, action adaptation, team attack balance, and no-attack advance / anti-idle pressure.",
@@ -164,6 +164,12 @@ class ModularRewardLLMInitializer:
                 "MMM2 is a heterogeneous Terran mirror with Marines, Marauders, and Medivacs, so prioritize modules that improve coordinated pressure under mixed-unit combat rather than only simple 3m-style target focus.",
                 "Because the runtime interface here does not expose unit types, medivac identity, or raw health vectors, do not invent healer-specific or unit-type-specific tensors; express MMM2 knowledge only through the allowed proxy coordination signals.",
                 "For MMM2, prefer modules that separate roles such as synchronized target focus, attack commitment, anti-idle pressure, team attack participation balance, adaptive target handoff, and late-fight target synchronization.",
+            ])
+        elif str(map_name).upper() == "27M_VS_30M":
+            lines.extend([
+                "27m_vs_30m is a homogeneous Marine-vs-Marine attrition map with a numeric disadvantage, so prioritize modules that improve disciplined focus fire, synchronized attack participation, anti-idle pressure, and target persistence under losing trades rather than heterogeneous-role reasoning.",
+                "Because both sides are pure Marines and the interface does not expose health arrays or positions, do not invent kiting-distance, hp-threshold, or unit-type-specific tensors; express the map-specific prior only through the allowed attack, idle, same-target, and team-participation proxies.",
+                "For 27m_vs_30m, prefer modules that help the team avoid scattered fire, reduce wasted hesitation, maintain attack commitment once pressure starts, and stabilize coordinated target handoff during extended mirror fights.",
             ])
         lines.extend([
             "Allowed observation / action interface comes from the environment snippets below.",
@@ -207,7 +213,7 @@ class ModularRewardLLMInitializer:
             "Goal: choose a small executable pool of auxiliary reward modules for sparse/delayed team rewards.",
             "The modules must be selected only from the catalog below.",
             "Return JSON with this schema:",
-            '{"modules": [{"name": "module_name", "scale": 0.0_to_2.0, "description": "short text", "when_to_use": "short text"}]}',
+            '{"modules": [{"name": "module_name", "description": "short text", "when_to_use": "short text"}]}',
             "Select at most {} modules. Prefer diverse modules with complementary incentives.".format(module_budget),
             "Catalog:",
         ]
@@ -241,16 +247,12 @@ class ModularRewardLLMInitializer:
             if not name or not source or name in seen:
                 continue
             seen.add(name)
-            try:
-                scale = max(0.0, min(float(item.get("scale", 1.0)), 2.0))
-            except Exception:
-                scale = 1.0
             required_inputs = item.get("required_inputs", [])
             if not isinstance(required_inputs, list):
                 required_inputs = []
             parsed.append({
                 "name": name,
-                "scale": scale,
+                "scale": 1.0,
                 "description": str(item.get("description", "")),
                 "when_to_use": str(item.get("when_to_use", "")),
                 "required_inputs": [str(v).strip() for v in required_inputs if str(v).strip()],
@@ -367,6 +369,8 @@ class ModularRewardLLMInitializer:
             gaps.append("A module for team attack participation balance or synchronized pressure is still under-covered.")
         if str(env_args.get("map_name", "")).upper() == "MMM2":
             gaps.append("For MMM2, prefer mixed-fight coordination proxies like target handoff, sustained pressure, or phase-sensitive participation rather than another generic focus-fire heuristic.")
+        elif str(env_args.get("map_name", "")).upper() == "27M_VS_30M":
+            gaps.append("For 27m_vs_30m, prefer homogeneous-mirror coordination proxies like disciplined same-target pressure, anti-idle attack commitment, and stable target persistence rather than heterogeneous-role heuristics.")
         if not gaps:
             gaps.append("Prefer a module that fills the least represented coordination role in the current pool.")
         return gaps[:4]
@@ -386,9 +390,8 @@ class ModularRewardLLMInitializer:
             weighted_score = stats_payload.get("module_weighted_scores", {}).get(module_key, stats_payload.get("module_weighted_scores", {}).get(module.get("name"), 0.0))
             activation = stats_payload.get("module_activation", {}).get(module_key, stats_payload.get("module_activation", {}).get(module.get("name"), 0.0))
             lines.append(
-                "- {name}: scale={scale}, usage={usage:.4f}, score={score:.4f}, contribution={contribution:.4f}, weighted_score={weighted_score:.4f}, activation={activation:.4f}".format(
+                "- {name}: usage={usage:.4f}, score={score:.4f}, contribution={contribution:.4f}, weighted_score={weighted_score:.4f}, activation={activation:.4f}".format(
                     name=module.get("name"),
-                    scale=module.get("scale"),
                     usage=usage,
                     score=score,
                     contribution=contribution,
@@ -446,6 +449,12 @@ class ModularRewardLLMInitializer:
                 "Do not assume access to medivac identity, ally health arrays, enemy health arrays, or unit-type masks; use only the allowed proxy coordination signals.",
                 "Avoid proposing another generic focus-fire clone unless it uses a genuinely different signal combination than the current pool.",
             ])
+        elif str(map_name).upper() == "27M_VS_30M":
+            lines.extend([
+                "27m_vs_30m is a homogeneous Marine mirror under unit-count disadvantage, so replacements should improve disciplined same-target damage concentration, sustained team attack participation, anti-idle pressure, and target persistence in long mirror skirmishes.",
+                "Do not assume access to unit hp, positions, or spacing; use only the allowed proxy coordination signals.",
+                "Avoid proposals that depend on heterogeneous-unit logic, healer logic, or distance-threshold logic that the runtime interface cannot observe.",
+            ])
         for tag in failure_tags:
             lines.append("- {}".format(tag))
         lines.extend([
@@ -483,11 +492,10 @@ class ModularRewardLLMInitializer:
         ])
         for module in current_specs.get("modules", []):
             lines.append(
-                "- {name} | id={id} | source_type={source_type} | scale={scale:.3f} | status={status} | description={description}".format(
+                "- {name} | id={id} | source_type={source_type} | status={status} | description={description}".format(
                     name=module.get("name"),
                     id=module.get("id"),
                     source_type=module.get("source_type", "builtin"),
-                    scale=float(module.get("scale", 1.0)),
                     status=module.get("status", "active"),
                     description=module.get("description", ""),
                 )
@@ -498,11 +506,10 @@ class ModularRewardLLMInitializer:
 
         lines.extend([
             "Target module to replace:",
-            "- name={name}, id={id}, source_type={source_type}, scale={scale:.3f}, status={status}, family={family}".format(
+            "- name={name}, id={id}, source_type={source_type}, status={status}, family={family}".format(
                 name=target_module.get("name"),
                 id=target_module.get("id"),
                 source_type=target_module.get("source_type", "builtin"),
-                scale=float(target_module.get("scale", 1.0)),
                 status=target_module.get("status", "active"),
                 family=target_family,
             ),
@@ -550,7 +557,7 @@ class ModularRewardLLMInitializer:
             "- Treat {} module(s) per family as a soft upper bound for the pool; if that family is already full, move to a different family.".format(family_cap),
             "Decision contract:",
             "Return strict JSON only with this schema:",
-            '{"action":"replace_module|keep_module","module":{"name":"new_name","scale":0.0_to_2.0,"description":"short text","when_to_use":"short text","python_function_source":"def compute_reward_module(features, tensors):\\n    ...","required_inputs":["feature_or_tensor_name"],"hypothesis":"short text","expected_effect":"short text","parent_id":"%s","version_parent":%s}}' % (target_module.get("id", ""), int(target_module.get("version", 1))),
+            '{"action":"replace_module|keep_module","module":{"name":"new_name","description":"short text","when_to_use":"short text","python_function_source":"def compute_reward_module(features, tensors):\\n    ...","required_inputs":["feature_or_tensor_name"],"hypothesis":"short text","expected_effect":"short text","parent_id":"%s","version_parent":%s}}' % (target_module.get("id", ""), int(target_module.get("version", 1))),
             "If the current module should remain unchanged, return {\"action\": \"keep_module\"}.",
         ])
         return "\n".join(lines)
@@ -648,11 +655,6 @@ class ModularRewardLLMInitializer:
         if not name or not source:
             return None
 
-        try:
-            scale = max(0.0, min(float(module.get("scale", 1.0)), 2.0))
-        except Exception:
-            scale = 1.0
-
         required_inputs = module.get("required_inputs", [])
         if not isinstance(required_inputs, list):
             required_inputs = []
@@ -662,7 +664,7 @@ class ModularRewardLLMInitializer:
             "action": action,
             "proposal": {
                 "name": name,
-                "scale": scale,
+                "scale": 1.0,
                 "description": str(module.get("description", "")).strip(),
                 "when_to_use": str(module.get("when_to_use", "")).strip(),
                 "python_function_source": source,

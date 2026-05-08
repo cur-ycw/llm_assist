@@ -1,8 +1,10 @@
 import copy
 import json
+import math
 import os
 
 import torch as th
+import torch.nn.functional as F
 from torch.optim import RMSprop
 
 from components.episode_buffer import EpisodeBatch
@@ -36,9 +38,13 @@ class ModularRewardQLearner:
         self.log_stats_t = -self.args.learner_log_interval - 1
 
         self.selector_hidden_dim = getattr(args, "modular_reward_selector_hidden_dim", 64)
-        self.selector_advantage_coef = getattr(args, "modular_reward_selector_advantage_coef", 0.05)
         self.selector_balance_coef = getattr(args, "modular_reward_selector_balance_coef", 0.01)
         self.selector_activation_threshold = getattr(args, "modular_reward_selector_activation_threshold", 0.35)
+        self.selector_feedback_coef = float(getattr(args, "modular_reward_selector_feedback_coef", 0.5))
+        self.selector_feedback_value_coef = float(getattr(args, "modular_reward_selector_feedback_value_coef", 0.5))
+        self.selector_feedback_target_temperature = float(getattr(args, "modular_reward_selector_feedback_target_temperature", 2.0))
+        self.selector_feedback_trust_prior_coef = float(getattr(args, "modular_reward_selector_feedback_trust_prior_coef", 0.35))
+        self.selector_trust_max_gate = float(getattr(args, "modular_reward_selector_trust_max_gate", 0.75))
 
         self.modular_reward_beta = getattr(args, "modular_reward_beta", getattr(args, "tactic_reward_scale", 0.3))
         self.modular_reward_beta_start = float(getattr(args, "modular_reward_beta_start", self.modular_reward_beta))
@@ -73,11 +79,30 @@ class ModularRewardQLearner:
             n_modules=self.module_pool.num_modules(),
             hidden_dim=self.selector_hidden_dim,
         )
+        self.selector_feedback_net = SelectorNetwork(
+            input_dim=self.module_pool.selector_input_dim(),
+            n_modules=self.module_pool.num_modules(),
+            hidden_dim=self.selector_hidden_dim,
+        )
         self.selector_value_net = ContextValueNetwork(
             input_dim=self.module_pool.selector_input_dim(),
             hidden_dim=self.selector_hidden_dim,
         )
-        self.selector_params = list(self.selector_net.parameters()) + list(self.selector_value_net.parameters())
+        self.selector_feedback_value_net = ContextValueNetwork(
+            input_dim=self.module_pool.selector_input_dim(),
+            hidden_dim=self.selector_hidden_dim,
+        )
+        self.selector_trust_gate_net = ContextValueNetwork(
+            input_dim=self.module_pool.selector_input_dim(),
+            hidden_dim=self.selector_hidden_dim,
+        )
+        self.selector_params = (
+            list(self.selector_net.parameters())
+            + list(self.selector_feedback_net.parameters())
+            + list(self.selector_value_net.parameters())
+            + list(self.selector_feedback_value_net.parameters())
+            + list(self.selector_trust_gate_net.parameters())
+        )
         self.selector_optimizer = RMSprop(
             params=self.selector_params,
             lr=getattr(args, "modular_reward_selector_lr", args.lr),
@@ -118,6 +143,9 @@ class ModularRewardQLearner:
         self._last_outer_selector_t_env = 0
         self.current_outer_prior = None
         self.current_outer_alpha = None
+        self._selector_feedback_context_sum = None
+        self._selector_feedback_exposure_sum = None
+        self._selector_feedback_batches = 0
         self.latest_selector_entropy = 0.0
         self.latest_aux_reward_mean = 0.0
         self.latest_selector_weight_mean = 0.0
@@ -126,6 +154,10 @@ class ModularRewardQLearner:
         self.latest_selector_advantage = 0.0
         self.latest_selector_balance = 0.0
         self.latest_selector_value_loss = 0.0
+        self.latest_selector_feedback_loss = 0.0
+        self.latest_selector_feedback_value_loss = 0.0
+        self.latest_selector_feedback_advantage = 0.0
+        self.latest_selector_feedback_target = 0.0
         self.latest_selector_top1_switch_rate = 0.0
         self.latest_selector_weight_std = 0.0
         self.latest_selector_time_std = 0.0
@@ -141,7 +173,10 @@ class ModularRewardQLearner:
         self.latest_outer_selector_alpha_mean = 0.0
         self.latest_outer_selector_alpha_max = 0.0
         self.latest_selector_trace = {}
+        self.latest_selector_trust_gate = 0.0
+        self.latest_selector_trust_bias_std = 0.0
         self.latest_test_win_rate = 0.0
+        self.latest_env_feedback_signal = 0.0
         self.latest_module_update_event_count = 0.0
         self.latest_module_update_trigger_count = 0.0
         self.latest_shaped_reward_delta_mean = 0.0
@@ -228,7 +263,18 @@ class ModularRewardQLearner:
         selector_context = self.module_pool.build_selector_context(actions, avail_actions[:, :-1])
         module_scores = self.module_pool.compute_module_scores(actions, avail_actions[:, :-1])
         selector_logits = self.selector_net(selector_context) / max(self.selector_temperature, 1e-6)
-        selector_weights = th.softmax(selector_logits, dim=-1)
+        selector_feedback_logits = self.selector_feedback_net(selector_context)
+        trust_prior = self.module_pool.get_trust_prior_tensor(device=selector_context.device)
+        trust_prior = trust_prior.view(1, 1, 1, -1).expand_as(selector_logits)
+        trust_bias = th.log(trust_prior.clamp(min=1e-8)) - math.log(1.0 / max(self.module_pool.num_modules(), 1))
+        trust_gate = th.sigmoid(self.selector_trust_gate_net(selector_context)).squeeze(-1)
+        trust_gate = trust_gate * self.selector_trust_max_gate * guidance_strength
+        combined_selector_logits = (
+            selector_logits
+            + self.selector_feedback_coef * selector_feedback_logits
+            + self.selector_feedback_trust_prior_coef * trust_gate.unsqueeze(-1) * trust_bias
+        )
+        selector_weights = th.softmax(combined_selector_logits, dim=-1)
         selector_values = self.selector_value_net(selector_context).squeeze(-1)
 
         if self.outer_selector_enabled and self.current_outer_prior is not None:
@@ -236,6 +282,7 @@ class ModularRewardQLearner:
             mix_coef = min(max(float(self.outer_selector_mix_coef), 0.0), 1.0) * guidance_strength
             selector_weights = (1.0 - mix_coef) * selector_weights + mix_coef * prior.expand_as(selector_weights)
             selector_weights = selector_weights / selector_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            combined_selector_logits = th.log(selector_weights.clamp(min=1e-8))
 
         selector_mode = getattr(self.args, "modular_reward_force_selector_mode", None)
         if selector_mode is None:
@@ -243,8 +290,9 @@ class ModularRewardQLearner:
         if selector_mode == 0:
             selector_weights = th.zeros_like(selector_weights)
             selector_values = th.zeros_like(selector_values)
+            trust_gate = th.zeros_like(trust_gate)
         elif selector_mode == 2:
-            selector_weights = th.softmax(selector_logits + 0.2 * guidance_strength, dim=-1)
+            selector_weights = th.softmax(combined_selector_logits + 0.2 * guidance_strength, dim=-1)
 
         module_contributions = selector_weights * module_scores
         transition_payload = self.module_pool.maybe_advance_transition(t_env)
@@ -296,22 +344,18 @@ class ModularRewardQLearner:
         if self.prev_selector_weights is not None and self.prev_selector_weights.shape == selector_weights.shape:
             selector_smoothing = ((selector_weights - self.prev_selector_weights) ** 2).mean()
 
-        score_baseline = module_scores.mean(dim=-1, keepdim=True)
-        module_advantages = module_scores - score_baseline
-        selector_advantage = -(selector_weights * module_advantages.detach()).sum(dim=-1)
         selector_balance = (selector_weights.mean(dim=(0, 1, 2)) - (1.0 / max(self.module_pool.num_modules(), 1))) ** 2
         selector_balance = selector_balance.mean()
-        selector_target = auxiliary_reward.squeeze(-1).detach()
-        selector_value_loss = ((selector_values - selector_target) ** 2).mean()
+        selector_value_loss = th.tensor(0.0, device=td_loss.device)
+        selector_policy_alignment = th.tensor(0.0, device=td_loss.device)
 
         selector_reg = (
-            -self.selector_entropy_coef * selector_entropy
+            -0.25 * self.selector_entropy_coef * selector_entropy
             + self.selector_smoothing_coef * selector_smoothing
-            + self.selector_advantage_coef * selector_advantage.mean()
-            + self.selector_balance_coef * selector_balance
+            + 0.25 * self.selector_balance_coef * selector_balance
             + float(getattr(self.args, "modular_reward_transition_loss_coef", 0.05)) * transition_loss
         )
-        selector_loss = selector_reg + selector_value_loss
+        selector_loss = selector_reg + selector_value_loss + selector_policy_alignment
         loss = td_loss + selector_loss
 
         self.optimiser.zero_grad()
@@ -323,6 +367,7 @@ class ModularRewardQLearner:
         self.selector_optimizer.step()
 
         self.prev_selector_weights = selector_weights.detach()
+        self._accumulate_selector_feedback_stats(selector_context, module_contributions)
         self._record_module_stats(selector_weights, module_scores, module_contributions)
         self._record_selector_diagnostics(selector_weights)
         self._save_selector_episode_artifact(t_env, episode_num, selector_weights, module_scores, module_contributions, actions)
@@ -338,9 +383,11 @@ class ModularRewardQLearner:
         self.latest_shaped_reward_delta_mean = clipped_shaped_reward_delta.mean().item()
         self.latest_shaped_reward_delta_clip_ratio = float((shaped_reward_delta.abs() > shaped_reward_delta_clip).float().mean().item())
         self.latest_selector_weight_mean = selector_weights.mean().item()
-        self.latest_selector_advantage = selector_advantage.mean().item()
+        self.latest_selector_advantage = 0.0
         self.latest_selector_balance = selector_balance.item()
-        self.latest_selector_value_loss = selector_value_loss.item()
+        self.latest_selector_value_loss = float(selector_value_loss.item())
+        self.latest_selector_trust_gate = float(trust_gate.mean().item())
+        self.latest_selector_trust_bias_std = float(trust_bias.std(dim=-1).mean().item())
         self.latest_transition_loss = float(transition_loss.item())
         self.latest_transition_progress = float(transition_progress)
         observed_win = self.latest_test_win_rate if self.latest_test_win_rate > 0.0 else 0.0
@@ -372,6 +419,12 @@ class ModularRewardQLearner:
             self.logger.log_stat("selector_advantage", self.latest_selector_advantage, t_env)
             self.logger.log_stat("selector_balance", self.latest_selector_balance, t_env)
             self.logger.log_stat("selector_value_loss", self.latest_selector_value_loss, t_env)
+            self.logger.log_stat("selector_trust_gate", self.latest_selector_trust_gate, t_env)
+            self.logger.log_stat("selector_trust_bias_std", self.latest_selector_trust_bias_std, t_env)
+            self.logger.log_stat("selector_feedback_loss", self.latest_selector_feedback_loss, t_env)
+            self.logger.log_stat("selector_feedback_value_loss", self.latest_selector_feedback_value_loss, t_env)
+            self.logger.log_stat("selector_feedback_advantage", self.latest_selector_feedback_advantage, t_env)
+            self.logger.log_stat("selector_feedback_target", self.latest_selector_feedback_target, t_env)
             self.logger.log_stat("transition_loss", self.latest_transition_loss, t_env)
             self.logger.log_stat("transition_progress", self.latest_transition_progress, t_env)
             self.logger.log_stat("outer_selector_loss", self.latest_outer_selector_loss, t_env)
@@ -401,6 +454,13 @@ class ModularRewardQLearner:
                 self.logger.log_stat("module_status_{}".format(module_name), module_status_code, t_env)
             for module_name, module_scale in self.module_pool.last_module_scale.items():
                 self.logger.log_stat("module_scale_{}".format(module_name), module_scale, t_env)
+            for module_name, module_credit in self.module_pool.last_module_env_credit.items():
+                self.logger.log_stat("module_env_credit_{}".format(module_name), module_credit, t_env)
+            for module_name, module_trust in self.module_pool.last_module_trust.items():
+                self.logger.log_stat("module_trust_{}".format(module_name), module_trust, t_env)
+            for module_name, module_trust_prior in self.module_pool.last_module_trust_prior.items():
+                self.logger.log_stat("module_trust_prior_{}".format(module_name), module_trust_prior, t_env)
+            self.logger.log_stat("env_feedback_signal", self.latest_env_feedback_signal, t_env)
             self.logger.log_stat("module_update_event_count", self.latest_module_update_event_count, t_env)
             self.logger.log_stat("module_update_trigger_count", self.latest_module_update_trigger_count, t_env)
             trigger_decision = getattr(self.module_pool, "last_trigger_decision", {}) or {}
@@ -410,12 +470,14 @@ class ModularRewardQLearner:
                 "absolute_low_signal": 1.0,
                 "relative_low_signal": 2.0,
                 "relative_low_signal_improving": 3.0,
+                "persistent_bad_module": 4.0,
             }
             self.logger.log_stat("module_update_trigger_mode", trigger_mode_map.get(trigger_decision.get("mode"), 0.0), t_env)
             self.logger.log_stat("module_update_trigger_stagnant", 1.0 if trigger_decision.get("stagnant", False) else 0.0, t_env)
             self.logger.log_stat("module_update_trigger_collapse", 1.0 if trigger_decision.get("collapse", False) else 0.0, t_env)
             self.logger.log_stat("module_update_trigger_improving", 1.0 if trigger_decision.get("improving", False) else 0.0, t_env)
             self.logger.log_stat("module_update_trigger_structural_bias", 1.0 if trigger_decision.get("structural_bias", False) else 0.0, t_env)
+            self.logger.log_stat("module_update_trigger_persistent_bad", 1.0 if trigger_decision.get("persistent_bad", False) else 0.0, t_env)
             self.logger.log_stat("module_count", float(self.module_pool.num_modules()), t_env)
             self.logger.log_stat("module_pending_update", 1.0 if self.module_pool.pending_update is not None else 0.0, t_env)
             for module_name, transition_alpha in self.module_pool.last_transition_alpha.items():
@@ -453,6 +515,81 @@ class ModularRewardQLearner:
         if self.mixer is not None:
             self.target_mixer.load_state_dict(self.mixer.state_dict())
         self.logger.console_logger.info("Updated target network")
+
+    def _accumulate_selector_feedback_stats(self, selector_context, module_contributions):
+        mean_context = selector_context.detach().mean(dim=(0, 1, 2))
+        mean_exposure = module_contributions.detach().mean(dim=(0, 1, 2))
+        if self._selector_feedback_context_sum is None:
+            self._selector_feedback_context_sum = mean_context.clone()
+            self._selector_feedback_exposure_sum = mean_exposure.clone()
+        else:
+            self._selector_feedback_context_sum = self._selector_feedback_context_sum + mean_context
+            self._selector_feedback_exposure_sum = self._selector_feedback_exposure_sum + mean_exposure
+        self._selector_feedback_batches += 1
+
+    def _consume_selector_feedback_summary(self):
+        if self._selector_feedback_batches <= 0 or self._selector_feedback_context_sum is None or self._selector_feedback_exposure_sum is None:
+            return None
+        summary = {
+            "context": (self._selector_feedback_context_sum / float(self._selector_feedback_batches)).detach().cpu(),
+            "exposure": (self._selector_feedback_exposure_sum / float(self._selector_feedback_batches)).detach().cpu(),
+            "count": int(self._selector_feedback_batches),
+        }
+        self._selector_feedback_context_sum = None
+        self._selector_feedback_exposure_sum = None
+        self._selector_feedback_batches = 0
+        return summary
+
+    def _update_selector_feedback_head(self, selector_summary, trust_update):
+        if selector_summary is None:
+            return
+        if "return_delta" not in trust_update or "win_rate_delta" not in trust_update:
+            return
+
+        context = selector_summary["context"].to(next(self.selector_feedback_net.parameters()).device)
+        exposure = selector_summary["exposure"].to(context.device)
+        if context.numel() <= 0 or exposure.numel() <= 0:
+            return
+
+        return_delta = float(trust_update.get("return_delta", 0.0))
+        win_rate_delta = float(trust_update.get("win_rate_delta", 0.0))
+        return_scale = max(float(getattr(self.args, "modular_reward_env_trust_return_scale", 2.0)), 1e-6)
+        win_rate_scale = max(float(getattr(self.args, "modular_reward_env_trust_win_scale", 0.05)), 1e-6)
+        normalized_return = max(min(return_delta / return_scale, 1.0), -1.0)
+        normalized_win = max(min(win_rate_delta / win_rate_scale, 1.0), -1.0)
+        target_signal = 0.7 * normalized_return + 0.3 * normalized_win
+
+        exposure = exposure - exposure.mean()
+        exposure_std = exposure.std(unbiased=False).clamp(min=1e-4)
+        target_logits = (exposure / exposure_std) * self.selector_feedback_target_temperature * target_signal
+        trust_prior = trust_update.get("prior", [])
+        if trust_prior:
+            trust_prior_tensor = th.tensor(trust_prior, dtype=th.float32, device=context.device)
+            trust_prior_tensor = trust_prior_tensor / trust_prior_tensor.sum().clamp(min=1e-8)
+            trust_logits = th.log(trust_prior_tensor.clamp(min=1e-8)) - math.log(1.0 / max(trust_prior_tensor.numel(), 1))
+            target_logits = target_logits + self.selector_feedback_trust_prior_coef * trust_logits
+        target_prior = th.softmax(target_logits, dim=0)
+
+        feedback_logits = self.selector_feedback_net(context.view(1, 1, 1, -1)).view(-1)
+        feedback_policy = th.softmax(feedback_logits, dim=-1)
+        log_feedback_policy = th.log(feedback_policy.clamp(min=1e-8))
+        feedback_value = self.selector_feedback_value_net(context.view(1, 1, 1, -1)).view(-1)[0]
+        feedback_target = th.tensor(target_signal, dtype=th.float32, device=context.device)
+        feedback_advantage = feedback_target - feedback_value.detach()
+        policy_loss = -(target_prior.detach() * log_feedback_policy).sum() * feedback_advantage
+        value_loss = F.mse_loss(feedback_value, feedback_target)
+        entropy = -(feedback_policy * log_feedback_policy).sum()
+        feedback_loss = policy_loss + self.selector_feedback_value_coef * value_loss - self.selector_entropy_coef * entropy
+
+        self.selector_optimizer.zero_grad()
+        feedback_loss.backward()
+        th.nn.utils.clip_grad_norm_(self.selector_params, self.args.grad_norm_clip)
+        self.selector_optimizer.step()
+
+        self.latest_selector_feedback_loss = float(policy_loss.item())
+        self.latest_selector_feedback_value_loss = float(value_loss.item())
+        self.latest_selector_feedback_advantage = float(feedback_advantage.item())
+        self.latest_selector_feedback_target = float(target_signal)
 
     def _record_module_stats(self, selector_weights, module_scores, module_contributions):
         activation_mask = (selector_weights >= self.selector_activation_threshold).float()
@@ -530,6 +667,10 @@ class ModularRewardQLearner:
         }
         feedback_payload.update(self.module_pool.get_latest_stats())
         self.module_pool.record_window_metrics(t_env, feedback_payload=feedback_payload)
+        selector_summary = self._consume_selector_feedback_summary()
+        trust_update = self.module_pool.update_env_feedback_trust(feedback_payload, t_env)
+        self._update_selector_feedback_head(selector_summary, trust_update)
+        self.latest_env_feedback_signal = float(trust_update.get("signal", 0.0))
 
         if self.modular_reward_module_update_interval > 0 and t_env > 0 and t_env - self.latest_module_update_check_t_env >= self.modular_reward_module_update_interval:
             self.latest_module_update_check_t_env = t_env
@@ -563,7 +704,10 @@ class ModularRewardQLearner:
         self.mac.cuda()
         self.target_mac.cuda()
         self.selector_net.cuda()
+        self.selector_feedback_net.cuda()
         self.selector_value_net.cuda()
+        self.selector_feedback_value_net.cuda()
+        self.selector_trust_gate_net.cuda()
         self.outer_loop_selector.cuda()
         if self.mixer is not None:
             self.mixer.cuda()
@@ -574,7 +718,10 @@ class ModularRewardQLearner:
         if self.mixer is not None:
             th.save(self.mixer.state_dict(), "{}/mixer.th".format(path))
         th.save(self.selector_net.state_dict(), "{}/selector.th".format(path))
+        th.save(self.selector_feedback_net.state_dict(), "{}/selector_feedback.th".format(path))
         th.save(self.selector_value_net.state_dict(), "{}/selector_value.th".format(path))
+        th.save(self.selector_feedback_value_net.state_dict(), "{}/selector_feedback_value.th".format(path))
+        th.save(self.selector_trust_gate_net.state_dict(), "{}/selector_trust_gate.th".format(path))
         th.save(self.outer_loop_selector.policy.state_dict(), "{}/outer_selector_policy.th".format(path))
         th.save(self.outer_loop_selector.value.state_dict(), "{}/outer_selector_value.th".format(path))
         th.save(self.optimiser.state_dict(), "{}/opt.th".format(path))
@@ -589,9 +736,18 @@ class ModularRewardQLearner:
         selector_path = "{}/selector.th".format(path)
         if os.path.exists(selector_path):
             self.selector_net.load_state_dict(th.load(selector_path, map_location=lambda storage, loc: storage))
+        selector_feedback_path = "{}/selector_feedback.th".format(path)
+        if os.path.exists(selector_feedback_path):
+            self.selector_feedback_net.load_state_dict(th.load(selector_feedback_path, map_location=lambda storage, loc: storage))
         selector_value_path = "{}/selector_value.th".format(path)
         if os.path.exists(selector_value_path):
             self.selector_value_net.load_state_dict(th.load(selector_value_path, map_location=lambda storage, loc: storage))
+        selector_feedback_value_path = "{}/selector_feedback_value.th".format(path)
+        if os.path.exists(selector_feedback_value_path):
+            self.selector_feedback_value_net.load_state_dict(th.load(selector_feedback_value_path, map_location=lambda storage, loc: storage))
+        selector_trust_gate_path = "{}/selector_trust_gate.th".format(path)
+        if os.path.exists(selector_trust_gate_path):
+            self.selector_trust_gate_net.load_state_dict(th.load(selector_trust_gate_path, map_location=lambda storage, loc: storage))
         outer_selector_policy_path = "{}/outer_selector_policy.th".format(path)
         if os.path.exists(outer_selector_policy_path):
             self.outer_loop_selector.policy.load_state_dict(th.load(outer_selector_policy_path, map_location=lambda storage, loc: storage))
