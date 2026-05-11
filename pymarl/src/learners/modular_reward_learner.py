@@ -45,6 +45,13 @@ class ModularRewardQLearner:
         self.selector_feedback_target_temperature = float(getattr(args, "modular_reward_selector_feedback_target_temperature", 2.0))
         self.selector_feedback_trust_prior_coef = float(getattr(args, "modular_reward_selector_feedback_trust_prior_coef", 0.35))
         self.selector_trust_max_gate = float(getattr(args, "modular_reward_selector_trust_max_gate", 0.75))
+        self.selector_trust_min_gate = float(getattr(args, "modular_reward_selector_trust_min_gate", 0.10))
+        self.local_router_horizon = int(getattr(args, "modular_reward_local_router_horizon", 10))
+        self.local_router_policy_coef = float(getattr(args, "modular_reward_local_router_policy_coef", 1.0))
+        self.local_router_value_coef = float(getattr(args, "modular_reward_local_router_value_coef", 0.5))
+        self.local_router_target_temperature = float(getattr(args, "modular_reward_local_router_target_temperature", 0.5))
+        self.local_router_use_contribution_target = bool(getattr(args, "modular_reward_local_router_use_contribution_target", True))
+        self.enable_window_feedback_head = bool(getattr(args, "modular_reward_enable_window_feedback_head", False))
 
         self.modular_reward_beta = getattr(args, "modular_reward_beta", getattr(args, "tactic_reward_scale", 0.3))
         self.modular_reward_beta_start = float(getattr(args, "modular_reward_beta_start", self.modular_reward_beta))
@@ -267,8 +274,9 @@ class ModularRewardQLearner:
         trust_prior = self.module_pool.get_trust_prior_tensor(device=selector_context.device)
         trust_prior = trust_prior.view(1, 1, 1, -1).expand_as(selector_logits)
         trust_bias = th.log(trust_prior.clamp(min=1e-8)) - math.log(1.0 / max(self.module_pool.num_modules(), 1))
-        trust_gate = th.sigmoid(self.selector_trust_gate_net(selector_context)).squeeze(-1)
-        trust_gate = trust_gate * self.selector_trust_max_gate * guidance_strength
+        raw_trust_gate = th.sigmoid(self.selector_trust_gate_net(selector_context)).squeeze(-1)
+        trust_gate = self.selector_trust_min_gate + (self.selector_trust_max_gate - self.selector_trust_min_gate) * raw_trust_gate
+        trust_gate = trust_gate * guidance_strength
         combined_selector_logits = (
             selector_logits
             + self.selector_feedback_coef * selector_feedback_logits
@@ -346,8 +354,17 @@ class ModularRewardQLearner:
 
         selector_balance = (selector_weights.mean(dim=(0, 1, 2)) - (1.0 / max(self.module_pool.num_modules(), 1))) ** 2
         selector_balance = selector_balance.mean()
-        selector_value_loss = th.tensor(0.0, device=td_loss.device)
-        selector_policy_alignment = th.tensor(0.0, device=td_loss.device)
+        selector_value_target, router_target, _ = self._compute_local_router_targets(
+            rewards=rewards,
+            terminated=terminated,
+            target_max_qvals=target_max_qvals.detach(),
+            selector_values=selector_values,
+            module_scores=module_scores.detach(),
+            module_contributions=module_contributions.detach(),
+        )
+        selector_value_loss = (((selector_values - selector_value_target.detach()) ** 2) * mask.expand_as(selector_values)).sum() / mask.expand_as(selector_values).sum().clamp(min=1.0)
+        router_log_policy = th.log(selector_weights.clamp(min=1e-8))
+        selector_policy_alignment = -((router_target.detach() * router_log_policy).sum(dim=-1, keepdim=False) * mask.expand_as(selector_values)).sum() / mask.expand_as(selector_values).sum().clamp(min=1.0)
 
         selector_reg = (
             -0.25 * self.selector_entropy_coef * selector_entropy
@@ -355,7 +372,11 @@ class ModularRewardQLearner:
             + 0.25 * self.selector_balance_coef * selector_balance
             + float(getattr(self.args, "modular_reward_transition_loss_coef", 0.05)) * transition_loss
         )
-        selector_loss = selector_reg + selector_value_loss + selector_policy_alignment
+        selector_loss = (
+            selector_reg
+            + self.local_router_value_coef * selector_value_loss
+            + self.local_router_policy_coef * selector_policy_alignment
+        )
         loss = td_loss + selector_loss
 
         self.optimiser.zero_grad()
@@ -516,6 +537,36 @@ class ModularRewardQLearner:
             self.target_mixer.load_state_dict(self.mixer.state_dict())
         self.logger.console_logger.info("Updated target network")
 
+    def _compute_local_router_targets(self, rewards, terminated, target_max_qvals, selector_values, module_scores, module_contributions):
+        horizon = max(int(self.local_router_horizon), 1)
+        local_targets = rewards.new_zeros(rewards.shape)
+        batch_size, max_t, _ = rewards.shape
+        for t in range(max_t):
+            discounted = rewards.new_zeros((batch_size, 1))
+            discount = 1.0
+            alive = rewards.new_ones((batch_size, 1))
+            for step in range(horizon):
+                idx = t + step
+                if idx >= max_t:
+                    break
+                discounted = discounted + discount * rewards[:, idx] * alive
+                alive = alive * (1.0 - terminated[:, idx])
+                discount = discount * self.args.gamma
+            bootstrap_index = t + horizon
+            if bootstrap_index < max_t:
+                discounted = discounted + discount * target_max_qvals[:, bootstrap_index] * alive
+            local_targets[:, t] = discounted
+
+        selector_value_target = local_targets.squeeze(-1).unsqueeze(-1).expand_as(selector_values)
+        local_advantage = selector_value_target - selector_values.detach()
+        module_target_source = module_contributions if self.local_router_use_contribution_target else module_scores
+        centered_target = module_target_source - module_target_source.mean(dim=-1, keepdim=True)
+        target_scale = centered_target.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        normalized_target = centered_target / target_scale
+        router_target_logits = normalized_target * local_advantage.unsqueeze(-1)
+        router_target = th.softmax(router_target_logits / max(self.local_router_target_temperature, 1e-6), dim=-1)
+        return selector_value_target, router_target, local_advantage
+
     def _accumulate_selector_feedback_stats(self, selector_context, module_contributions):
         mean_context = selector_context.detach().mean(dim=(0, 1, 2))
         mean_exposure = module_contributions.detach().mean(dim=(0, 1, 2))
@@ -541,6 +592,12 @@ class ModularRewardQLearner:
         return summary
 
     def _update_selector_feedback_head(self, selector_summary, trust_update):
+        if not self.enable_window_feedback_head:
+            self.latest_selector_feedback_loss = 0.0
+            self.latest_selector_feedback_value_loss = 0.0
+            self.latest_selector_feedback_advantage = 0.0
+            self.latest_selector_feedback_target = 0.0
+            return
         if selector_summary is None:
             return
         if "return_delta" not in trust_update or "win_rate_delta" not in trust_update:

@@ -131,6 +131,8 @@ cython_debug/
 # Project specific
 core
 results/
+wandb/
+*.pdf
 *.pyc
 .DS_Store
 .idea/

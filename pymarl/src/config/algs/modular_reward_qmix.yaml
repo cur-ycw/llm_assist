@@ -53,6 +53,13 @@ modular_reward_selector_feedback_value_coef: 0.5
 modular_reward_selector_feedback_target_temperature: 2.0
 modular_reward_selector_feedback_trust_prior_coef: 0.35
 modular_reward_selector_trust_max_gate: 0.75
+modular_reward_selector_trust_min_gate: 0.10
+modular_reward_local_router_horizon: 10
+modular_reward_local_router_policy_coef: 1.0
+modular_reward_local_router_value_coef: 0.5
+modular_reward_local_router_target_temperature: 0.5
+modular_reward_local_router_use_contribution_target: True
+modular_reward_enable_window_feedback_head: False
 modular_reward_bad_trust_threshold: -0.03
 modular_reward_bad_credit_threshold: -0.01
 modular_reward_selector_activation_threshold: 0.35
