@@ -18,7 +18,7 @@ buffer_cpu_only: True
 
 # --- Logging options ---
 use_tensorboard: True
-use_wandb: False
+use_wandb: True
 wandb_project: "pymarl"
 wandb_entity: null
 wandb_group: null

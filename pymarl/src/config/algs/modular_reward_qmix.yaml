@@ -34,10 +34,10 @@ modular_reward_llm_timeout: 60
 modular_reward_llm_key_source: "/root/ycw/human_aicoord/SemDiv/language/call_llm.py"
 
 modular_reward_beta: 0.3
-modular_reward_beta_start: 0.1
+modular_reward_beta_start: 0.3
 modular_reward_beta_end: 0.3
-modular_reward_beta_ramp_start_steps: 100000
-modular_reward_beta_ramp_steps: 600000
+modular_reward_beta_ramp_start_steps: 0
+modular_reward_beta_ramp_steps: 0
 modular_reward_guidance_start_steps: 100000
 modular_reward_guidance_ramp_steps: 250000
 modular_reward_min_beta_ratio: 0.1
@@ -54,12 +54,16 @@ modular_reward_selector_feedback_target_temperature: 2.0
 modular_reward_selector_feedback_trust_prior_coef: 0.35
 modular_reward_selector_trust_max_gate: 0.75
 modular_reward_selector_trust_min_gate: 0.10
-modular_reward_local_router_horizon: 10
-modular_reward_local_router_policy_coef: 1.0
+modular_reward_local_router_horizon: 3
+modular_reward_local_router_policy_coef: 2.0
 modular_reward_local_router_value_coef: 0.5
-modular_reward_local_router_target_temperature: 0.5
+modular_reward_local_router_target_temperature: 0.1
 modular_reward_local_router_use_contribution_target: True
 modular_reward_enable_window_feedback_head: False
+# Per-agent auxiliary Q loss (LIGHT-style): default on
+modular_reward_per_agent_aux_enabled: True
+modular_reward_per_agent_aux_coef: 0.5
+modular_reward_per_agent_aux_reward_scale: 1.0
 modular_reward_bad_trust_threshold: -0.03
 modular_reward_bad_credit_threshold: -0.01
 modular_reward_selector_activation_threshold: 0.35

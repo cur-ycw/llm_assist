@@ -53,6 +53,12 @@ class ModularRewardQLearner:
         self.local_router_use_contribution_target = bool(getattr(args, "modular_reward_local_router_use_contribution_target", True))
         self.enable_window_feedback_head = bool(getattr(args, "modular_reward_enable_window_feedback_head", False))
 
+        # Per-agent auxiliary Q loss (LIGHT-style, eq. 7): L_i = (r_i + gamma * max Q_i' - Q_i)^2
+        # Kept orthogonal to the team shaped-reward TD loss.
+        self.per_agent_aux_enabled = bool(getattr(args, "modular_reward_per_agent_aux_enabled", True))
+        self.per_agent_aux_coef = float(getattr(args, "modular_reward_per_agent_aux_coef", 0.5))
+        self.per_agent_aux_reward_scale = float(getattr(args, "modular_reward_per_agent_aux_reward_scale", 1.0))
+
         self.modular_reward_beta = getattr(args, "modular_reward_beta", getattr(args, "tactic_reward_scale", 0.3))
         self.modular_reward_beta_start = float(getattr(args, "modular_reward_beta_start", self.modular_reward_beta))
         self.modular_reward_beta_end = float(getattr(args, "modular_reward_beta_end", self.modular_reward_beta))
@@ -192,6 +198,8 @@ class ModularRewardQLearner:
         self.latest_transition_progress = 1.0
         self.latest_module_update_check_t_env = 0
         self.latest_selector_viz_t_env = 0
+        self.latest_per_agent_aux_loss = 0.0
+        self.latest_per_agent_aux_reward_mean = 0.0
 
     def update_win_stat(self, win_rate: float):
         self.latest_test_win_rate = float(win_rate)
@@ -337,6 +345,10 @@ class ModularRewardQLearner:
         else:
             target_max_qvals = target_mac_out.max(dim=3)[0]
 
+        # Keep pre-mixer per-agent Q-values for the LIGHT-style per-agent auxiliary TD loss (eq. 7).
+        chosen_action_qvals_agent = chosen_action_qvals
+        target_max_qvals_agent = target_max_qvals
+
         if self.mixer is not None:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
@@ -346,6 +358,20 @@ class ModularRewardQLearner:
         mask_expanded = mask.expand_as(td_error)
         masked_td_error = td_error * mask_expanded
         td_loss = (masked_td_error ** 2).sum() / mask_expanded.sum()
+
+        # LIGHT eq. (7): per-agent auxiliary TD loss using pre-mixer Q_i and the per-agent
+        # intrinsic reward r_i derived from module_contributions. Keeps team shaped-reward
+        # TD intact; this loss only adds direct per-agent gradient signal for r_i.
+        per_agent_aux_loss = th.tensor(0.0, device=td_loss.device)
+        per_agent_aux_reward = th.zeros_like(auxiliary_reward)  # [B, T, N, 1]
+        if self.per_agent_aux_enabled:
+            per_agent_aux_reward = auxiliary_reward.detach()  # [B, T, N, 1]
+            r_i = self.per_agent_aux_reward_scale * per_agent_aux_reward.squeeze(-1)  # [B, T, N]
+            terminated_agent = terminated.expand_as(r_i)  # [B, T, N]
+            ind_target = r_i + self.args.gamma * (1.0 - terminated_agent) * target_max_qvals_agent.detach()
+            ind_td_error = chosen_action_qvals_agent - ind_target.detach()
+            ind_mask = mask.expand_as(ind_td_error)
+            per_agent_aux_loss = ((ind_td_error ** 2) * ind_mask).sum() / ind_mask.sum().clamp(min=1.0)
 
         selector_entropy = -(selector_weights * (selector_weights.clamp(min=1e-8).log())).sum(dim=-1).mean()
         selector_smoothing = th.tensor(0.0, device=td_loss.device)
@@ -377,7 +403,7 @@ class ModularRewardQLearner:
             + self.local_router_value_coef * selector_value_loss
             + self.local_router_policy_coef * selector_policy_alignment
         )
-        loss = td_loss + selector_loss
+        loss = td_loss + selector_loss + self.per_agent_aux_coef * per_agent_aux_loss
 
         self.optimiser.zero_grad()
         self.selector_optimizer.zero_grad()
@@ -411,6 +437,8 @@ class ModularRewardQLearner:
         self.latest_selector_trust_bias_std = float(trust_bias.std(dim=-1).mean().item())
         self.latest_transition_loss = float(transition_loss.item())
         self.latest_transition_progress = float(transition_progress)
+        self.latest_per_agent_aux_loss = float(per_agent_aux_loss.item())
+        self.latest_per_agent_aux_reward_mean = float(per_agent_aux_reward.mean().item())
         observed_win = self.latest_test_win_rate if self.latest_test_win_rate > 0.0 else 0.0
         self.state_tracker.update(
             win=observed_win,
@@ -448,6 +476,9 @@ class ModularRewardQLearner:
             self.logger.log_stat("selector_feedback_target", self.latest_selector_feedback_target, t_env)
             self.logger.log_stat("transition_loss", self.latest_transition_loss, t_env)
             self.logger.log_stat("transition_progress", self.latest_transition_progress, t_env)
+            self.logger.log_stat("per_agent_aux_loss", self.latest_per_agent_aux_loss, t_env)
+            self.logger.log_stat("per_agent_aux_reward_mean", self.latest_per_agent_aux_reward_mean, t_env)
+            self.logger.log_stat("per_agent_aux_enabled", 1.0 if self.per_agent_aux_enabled else 0.0, t_env)
             self.logger.log_stat("outer_selector_loss", self.latest_outer_selector_loss, t_env)
             self.logger.log_stat("outer_selector_policy_loss", self.latest_outer_selector_policy_loss, t_env)
             self.logger.log_stat("outer_selector_value_loss", self.latest_outer_selector_value_loss, t_env)

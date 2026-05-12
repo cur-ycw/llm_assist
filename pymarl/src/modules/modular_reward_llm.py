@@ -144,21 +144,150 @@ class ModularRewardLLMInitializer:
         data = response.json()
         return data["choices"][0]["message"]["content"]
 
+    def _map_facts(self, map_name: str) -> List[str]:
+        key = str(map_name).lower()
+        registry = {
+            "3m": [
+                "3m: 3 allied Marines vs 3 enemy Marines. Symmetric Terran composition, all ranged.",
+            ],
+            "8m": [
+                "8m: 8 allied Marines vs 8 enemy Marines. Symmetric Terran composition, all ranged.",
+            ],
+            "25m": [
+                "25m: 25 allied Marines vs 25 enemy Marines. Symmetric Terran composition, all ranged.",
+            ],
+            "5m_vs_6m": [
+                "5m_vs_6m: 5 allied Marines vs 6 enemy Marines. Terran ranged mirror with a 1-unit numerical disadvantage for the ally.",
+            ],
+            "8m_vs_9m": [
+                "8m_vs_9m: 8 allied Marines vs 9 enemy Marines. Terran ranged mirror with a 1-unit numerical disadvantage for the ally.",
+            ],
+            "10m_vs_11m": [
+                "10m_vs_11m: 10 allied Marines vs 11 enemy Marines. Terran ranged mirror with a 1-unit numerical disadvantage for the ally.",
+            ],
+            "27m_vs_30m": [
+                "27m_vs_30m: 27 allied Marines vs 30 enemy Marines. Terran ranged mirror with a 3-unit numerical disadvantage for the ally.",
+            ],
+            "mmm": [
+                "MMM: ally has 1 Medivac, 2 Marauders, and 7 Marines; enemy has the same composition.",
+                "Marines are basic ranged Terran infantry.",
+                "Marauders are ranged Terran units with anti-armor damage and slower movement than Marines.",
+                "Medivacs are Terran support air units that heal nearby allied biological units; they do not deal damage.",
+            ],
+            "mmm2": [
+                "MMM2: ally has 1 Medivac, 2 Marauders, and 7 Marines; enemy has 1 Medivac, 3 Marauders, and 8 Marines (1 extra Marauder and 1 extra Marine).",
+                "Marines are basic ranged Terran infantry.",
+                "Marauders are ranged Terran units with anti-armor damage and slower movement than Marines.",
+                "Medivacs are Terran support air units that heal nearby allied biological units; they do not deal damage.",
+            ],
+            "2s3z": [
+                "2s3z: ally has 2 Stalkers and 3 Zealots; enemy has the same composition.",
+                "Stalkers are ranged Protoss units.",
+                "Zealots are melee Protoss units that must reach melee contact to deal damage.",
+            ],
+            "3s5z": [
+                "3s5z: ally has 3 Stalkers and 5 Zealots; enemy has the same composition.",
+                "Stalkers are ranged Protoss units.",
+                "Zealots are melee Protoss units that must reach melee contact to deal damage.",
+            ],
+            "3s5z_vs_3s6z": [
+                "3s5z_vs_3s6z: ally has 3 Stalkers and 5 Zealots; enemy has 3 Stalkers and 6 Zealots (1 extra Zealot).",
+                "Stalkers are ranged Protoss units.",
+                "Zealots are melee Protoss units that must reach melee contact to deal damage.",
+            ],
+            "3s_vs_3z": [
+                "3s_vs_3z: 3 allied Stalkers vs 3 enemy Zealots. Equal unit count, asymmetric types.",
+                "Stalkers are ranged Protoss units; Zealots are melee Protoss units that must reach melee contact to deal damage.",
+            ],
+            "3s_vs_4z": [
+                "3s_vs_4z: 3 allied Stalkers vs 4 enemy Zealots (ally has a 1-unit numerical disadvantage).",
+                "Stalkers are ranged Protoss units; Zealots are melee Protoss units that must reach melee contact to deal damage.",
+            ],
+            "3s_vs_5z": [
+                "3s_vs_5z: 3 allied Stalkers vs 5 enemy Zealots (ally has a 2-unit numerical disadvantage).",
+                "Stalkers are ranged Protoss units; Zealots are melee Protoss units that must reach melee contact to deal damage.",
+            ],
+            "2m_vs_1z": [
+                "2m_vs_1z: 2 allied Marines (ranged Terran) vs 1 enemy Zealot (melee Protoss, must reach melee contact to deal damage).",
+            ],
+            "2s_vs_1sc": [
+                "2s_vs_1sc: 2 allied Stalkers (ranged Protoss) vs 1 enemy Spine Crawler (stationary ranged Zerg defensive unit).",
+            ],
+            "1c3s5z": [
+                "1c3s5z: ally has 1 Colossus, 3 Stalkers, and 5 Zealots; enemy has the same composition.",
+                "Colossi are high-HP ranged Protoss units with area-of-effect attacks.",
+                "Stalkers are ranged Protoss units.",
+                "Zealots are melee Protoss units that must reach melee contact to deal damage.",
+            ],
+            "2c_vs_64zg": [
+                "2c_vs_64zg: 2 allied Colossi (ranged Protoss with area-of-effect attack) vs 64 enemy Zerglings (fast melee Zerg swarm).",
+            ],
+            "corridor": [
+                "corridor: 6 allied Zealots (melee Protoss) vs 24 enemy Zerglings (fast melee Zerg swarm), with the engagement taking place in a narrow corridor-shaped layout.",
+            ],
+            "6h_vs_8z": [
+                "6h_vs_8z: 6 allied Hydralisks (ranged Zerg) vs 8 enemy Zealots (melee Protoss). Ally has a 2-unit numerical disadvantage.",
+            ],
+            "bane_vs_bane": [
+                "bane_vs_bane: ally has 20 Zerglings and 4 Banelings; enemy has the same composition.",
+                "Zerglings are fast melee Zerg units.",
+                "Banelings are Zerg units with area-of-effect damage that die when they explode on contact.",
+            ],
+            "so_many_baneling": [
+                "so_many_baneling: 7 allied Zealots (melee Protoss) vs 32 enemy Banelings (Zerg area-of-effect suicide units that die when they explode on contact).",
+            ],
+        }
+        return registry.get(key, [])
+
+    def _proxy_feature_semantics(self) -> List[str]:
+        return [
+            "Per-agent proxy signal definitions (plain facts, no strategy implied):",
+            "- features['attack_avail']: 1 if at least one attack action is currently available to this agent, else 0.",
+            "- features['chose_attack']: 1 if this agent selected an attack action this step, else 0.",
+            "- features['chose_move']: 1 if this agent selected a movement action this step, else 0.",
+            "- features['chose_idle']: 1 if this agent selected the no-op/idle action this step, else 0.",
+            "- features['has_teammate_same_target']: 1 if this agent attacks and at least one teammate attacks the same enemy this step, else 0.",
+            "- features['same_target_as_prev']: 1 if this agent attacked both the previous and current step with the same target index, else 0.",
+            "- features['switched_target']: 1 if this agent attacked both the previous and current step but the target index changed, else 0.",
+            "- features['same_action_as_prev']: 1 if this agent's action index is identical at the previous and current step, else 0.",
+            "- features['team_attack_ratio']: fraction of allied agents that selected an attack action this step.",
+            "- features['same_target_ratio']: fraction of attacking allies this step whose target equals this agent's target.",
+            "- tensors['actions']: integer tensor [batch, time, n_agents, 1] of chosen action indices.",
+            "- tensors['avail_actions']: 0/1 tensor [batch, time, n_agents, n_actions] of which actions are available.",
+            "- tensors['attack_action_start']: the smallest action index that represents 'attack enemy k'; indices below this are no-op / stop / movement.",
+        ]
+
+    def _shaping_aggregation_note(self) -> List[str]:
+        return [
+            "Shaping aggregation contract (facts about how module outputs are consumed):",
+            "- each module outputs a per-agent tensor r_i[batch, time, n_agents].",
+            "- the selector combines per-agent module outputs into per-agent contributions c_i[batch, time, n_agents].",
+            "- the team shaped-reward delta added to the environment reward is beta * mean_over_agents(sum_of_selected c_i).",
+            "- the same per-agent contributions also drive a per-agent auxiliary Q loss that back-propagates directly into each agent's network.",
+        ]
+
     def _build_initial_pool_prompt(self, module_catalog: List[Dict], env_name: str, env_args: Dict, module_budget: int) -> str:
         map_name = env_args.get("map_name", "unknown")
         lines = [
             "We are building the initial modular reward agent for cooperative MARL in PyMARL.",
             "The environment is {} on map {}.".format(env_name, map_name),
-            "Task: generate a small executable pool of auxiliary reward modules for sparse/delayed team rewards.",
+            "Task: generate a small executable pool of auxiliary reward modules.",
             "Do not just pick from a catalog; generate the actual reward module implementations.",
+            "You are asked to propose modules; you are not given any predetermined strategy and must reason from the facts below.",
             "Return JSON with this schema:",
             '{"modules": [{"name": "module_name", "description": "short text", "when_to_use": "short text", "required_inputs": ["..."], "hypothesis": "short text", "expected_effect": "short text", "python_function_source": "def compute_reward_module(features, tensors):\\n    ..."}]}',
             "Return exactly {} modules unless the interface constraints make one impossible.".format(module_budget),
             "Each module must belong to a meaningfully different behaviour family; avoid near-duplicates that only rename the same heuristic.",
-            "Prefer coverage across distinct coordination roles such as: focus fire, attack commitment, target persistence / handoff, action adaptation, team attack balance, and no-attack advance / anti-idle pressure.",
-            "At least half of the modules should target mid-game or late-game coordination weaknesses rather than early exploration only.",
-            "If one family is already represented, the next modules should preferentially cover underrepresented coordination gaps instead of making minor variants of the same family.",
+            "Behaviour families available in the proxy feature interface include: focus_fire (teammates attacking the same target), target_persistence (keeping the same target across steps), target_handoff (switching target when appropriate), attack_commitment (attacking rather than idling), team_participation (fraction of team simultaneously attacking), and action_adaptation (alignment or change in chosen action across steps). Prefer covering distinct families over stacking variants of the same family.",
+            "Treat these families as orthogonal slots. If two candidate modules would end up using essentially the same underlying signal (or one is the sign-flipped / ratio-vs-boolean version of another), drop one and fill the slot with an underrepresented family instead.",
+            "Non-linear shaping (e.g. a U-shape, clipped gap, or interaction between two features) is preferred over a single raw feature whenever it captures the intent more faithfully.",
         ]
+        if str(map_name).lower() == "3s_vs_5z":
+            lines.extend([
+                "3s_vs_5z is 3 allied ranged Stalkers against 5 enemy melee Zealots; allies have a 2-unit numerical disadvantage but a range advantage.",
+                "Because the interface does not expose positions, health, or distances, do not invent kiting-distance, hp-threshold, or melee-contact tensors; express the map-specific prior only through the allowed attack, idle, same-target, switched-target, same-action, team-attack, and same-target-ratio proxies.",
+                "For 3s_vs_5z, prefer modules that improve concentrated damage on a single Zealot so the ranged team removes melee attackers one at a time, discourage idle frames during kiting-style combat, and stabilize target persistence so Zealots cannot get free hits from split damage.",
+            ])
         if str(map_name).upper() == "MMM2":
             lines.extend([
                 "MMM2 is a heterogeneous Terran mirror with Marines, Marauders, and Medivacs, so prioritize modules that improve coordinated pressure under mixed-unit combat rather than only simple 3m-style target focus.",
@@ -171,6 +300,14 @@ class ModularRewardLLMInitializer:
                 "Because both sides are pure Marines and the interface does not expose health arrays or positions, do not invent kiting-distance, hp-threshold, or unit-type-specific tensors; express the map-specific prior only through the allowed attack, idle, same-target, and team-participation proxies.",
                 "For 27m_vs_30m, prefer modules that help the team avoid scattered fire, reduce wasted hesitation, maintain attack commitment once pressure starts, and stabilize coordinated target handoff during extended mirror fights.",
             ])
+        map_facts = self._map_facts(map_name)
+        if map_facts:
+            lines.append("Map facts (objective composition only, no strategy):")
+            for fact in map_facts:
+                lines.append("- {}".format(fact))
+        lines.append("Winning condition: eliminate all enemy units. Losing condition: all allied units die or the episode times out.")
+        lines.extend(self._proxy_feature_semantics())
+        lines.extend(self._shaping_aggregation_note())
         lines.extend([
             "Allowed observation / action interface comes from the environment snippets below.",
             "Environment snippets:",
@@ -180,12 +317,6 @@ class ModularRewardLLMInitializer:
             lines.append(snippet)
             lines.append("```")
         lines.extend([
-            "Current design intent:",
-            "- shared module pool",
-            "- per-agent contextual selector",
-            "- training reward = env reward + beta * auxiliary reward",
-            "- choose modules that are useful for SMAC micromanagement and coordination",
-            "- the module pool should contain complementary modules rather than repeated variants of the same heuristic",
             "Strict interface contract:",
             "- function signature must be: def compute_reward_module(features, tensors):",
             "- you may only reference these feature keys: attack_avail, chose_attack, chose_move, chose_idle, has_teammate_same_target, same_target_as_prev, switched_target, same_action_as_prev, team_attack_ratio, same_target_ratio",
@@ -367,10 +498,6 @@ class ModularRewardLLMInitializer:
             gaps.append("A module for sustained attack participation or pressure commitment is still under-covered.")
         if "team_balance" not in families:
             gaps.append("A module for team attack participation balance or synchronized pressure is still under-covered.")
-        if str(env_args.get("map_name", "")).upper() == "MMM2":
-            gaps.append("For MMM2, prefer mixed-fight coordination proxies like target handoff, sustained pressure, or phase-sensitive participation rather than another generic focus-fire heuristic.")
-        elif str(env_args.get("map_name", "")).upper() == "27M_VS_30M":
-            gaps.append("For 27m_vs_30m, prefer homogeneous-mirror coordination proxies like disciplined same-target pressure, anti-idle attack commitment, and stable target persistence rather than heterogeneous-role heuristics.")
         if not gaps:
             gaps.append("Prefer a module that fills the least represented coordination role in the current pool.")
         return gaps[:4]
@@ -436,27 +563,23 @@ class ModularRewardLLMInitializer:
 
         lines = [
             "We are updating one auxiliary reward module in a PyMARL cooperative MARL system.",
-            "Task: improve late-game coordination on {} / {} without destabilising training.".format(env_name, map_name),
+            "Task: design a replacement executable reward module for {} / {} given only the facts and proxies below; do not rely on any predetermined strategy.".format(env_name, map_name),
             "Only update a module that has been persistently low-usage, low-contribution, or strategically redundant.",
             "Generate a replacement executable reward function module, not a scale tweak.",
             "The replacement should respond to the failure diagnosis below, not just rename the old heuristic.",
             "Target module family: {}.".format(target_family),
             "Failure summary tags:",
         ]
-        if str(map_name).upper() == "MMM2":
-            lines.extend([
-                "MMM2 is a heterogeneous Marine/Marauder/Medivac fight, so replacements should improve mixed-team coordination proxies such as synchronized pressure, disciplined target handoff, and sustained attack participation.",
-                "Do not assume access to medivac identity, ally health arrays, enemy health arrays, or unit-type masks; use only the allowed proxy coordination signals.",
-                "Avoid proposing another generic focus-fire clone unless it uses a genuinely different signal combination than the current pool.",
-            ])
-        elif str(map_name).upper() == "27M_VS_30M":
-            lines.extend([
-                "27m_vs_30m is a homogeneous Marine mirror under unit-count disadvantage, so replacements should improve disciplined same-target damage concentration, sustained team attack participation, anti-idle pressure, and target persistence in long mirror skirmishes.",
-                "Do not assume access to unit hp, positions, or spacing; use only the allowed proxy coordination signals.",
-                "Avoid proposals that depend on heterogeneous-unit logic, healer logic, or distance-threshold logic that the runtime interface cannot observe.",
-            ])
         for tag in failure_tags:
             lines.append("- {}".format(tag))
+        map_facts = self._map_facts(map_name)
+        if map_facts:
+            lines.append("Map facts (objective composition only, no strategy):")
+            for fact in map_facts:
+                lines.append("- {}".format(fact))
+        lines.append("Winning condition: eliminate all enemy units. Losing condition: all allied units die or the episode times out.")
+        lines.extend(self._proxy_feature_semantics())
+        lines.extend(self._shaping_aggregation_note())
         lines.extend([
             "Current family coverage in the module pool:",
         ])
