@@ -35,11 +35,6 @@ EUREKA_ROOT_DIR = os.getcwd()
 RL_ROOT_DIR = f"{EUREKA_ROOT_DIR}/../rl"
 
 PROMPT_BUNDLE_BY_INTERFACE = {
-    "locomotion": {
-        "initial_system": "initial_system.txt",
-        "reward_signature": "reward_signature.txt",
-        "policy_feedback": "policy_feedback_locomotion.txt",
-    },
     "walker": {
         "initial_system": "initial_system_walker.txt",
         "reward_signature": "reward_signature_walker.txt",
@@ -49,11 +44,6 @@ PROMPT_BUNDLE_BY_INTERFACE = {
         "initial_system": "initial_system_ant.txt",
         "reward_signature": "reward_signature_ant.txt",
         "policy_feedback": "policy_feedback_locomotion.txt",
-    },
-    "manipulation": {
-        "initial_system": "initial_system_metaworld.txt",
-        "reward_signature": "reward_signature_metaworld.txt",
-        "policy_feedback": "policy_feedback_manipulation.txt",
     },
     "reach": {
         "initial_system": "initial_system_reach.txt",
@@ -69,11 +59,6 @@ PROMPT_BUNDLE_BY_INTERFACE = {
         "initial_system": "initial_system_door.txt",
         "reward_signature": "reward_signature_door.txt",
         "policy_feedback": "policy_feedback_manipulation.txt",
-    },
-    "geometric_control": {
-        "initial_system": "initial_system_geometric_control.txt",
-        "reward_signature": "reward_signature_geometric_control.txt",
-        "policy_feedback": "policy_feedback_geometric_control.txt",
     },
 }
 

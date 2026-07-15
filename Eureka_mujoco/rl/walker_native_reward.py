@@ -2,13 +2,16 @@
 
 Matches the reward used by `eureka/envs/mujoco/walker2d_v4.py`:
     reward = x_velocity + healthy_reward - control_cost
+
+The first argument is the raw MuJoCo Walker2dEnv (post-`unwrapped`), matching
+the raw-env contract used by RewardOverrideWrapper.
 """
 
 
-def compute_reward(reward_view, obs, action):
-    x_velocity = float(reward_view.x_velocity)
-    healthy_reward = float(reward_view.healthy_reward)
-    control_cost = float(reward_view.control_cost)
+def compute_reward(env, obs, action):
+    x_velocity = float(env.data.qvel[0])
+    healthy_reward = float(env.healthy_reward)
+    control_cost = float(env.control_cost(action))
     reward = x_velocity + healthy_reward - control_cost
     return reward, {
         "forward_reward": x_velocity,

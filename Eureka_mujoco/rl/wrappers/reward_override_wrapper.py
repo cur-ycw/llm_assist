@@ -9,19 +9,11 @@ from __future__ import annotations
 import gymnasium as gym
 import numpy as np
 
-from rl.wrappers.reward_view import (
-    build_ant_reward_view,
-    build_geometric_control_reward_view,
-    build_manipulation_reward_view,
-    build_reward_view,
-    build_walker_reward_view,
-)
-
 
 class RewardOverrideWrapper(gym.Wrapper):
-    def __init__(self, env, gpt_reward_fn, gt_reward_fn, env_family: str = "locomotion"):
+    def __init__(self, env, gpt_reward_fn, gt_reward_fn, env_family: str = "ant"):
         super().__init__(env)
-        if env_family not in {"locomotion", "walker", "ant", "manipulation", "reach", "pick", "door", "geometric_control"}:
+        if env_family not in {"walker", "ant", "reach", "pick", "door"}:
             raise ValueError(f"unknown env_family={env_family!r}")
         self._env_family = env_family
         self._gpt_reward_fn = gpt_reward_fn
@@ -46,40 +38,17 @@ class RewardOverrideWrapper(gym.Wrapper):
         obs, env_reward, terminated, truncated, info = self.env.step(action)
         self._native_env_return += float(env_reward)
 
-        if self._env_family in {"locomotion", "walker", "ant"}:
+        if self._env_family in {"walker", "ant"}:
             prev_x = self._last_x
         else:
             prev_x = None
 
+        # For all five tasks, the LLM reward function receives the raw MuJoCo /
+        # MetaWorld env directly, mirroring the original Eureka behaviour where
+        # the reward function sees the full env class.
         unwrapped = self.env.unwrapped
-        if self._env_family == "manipulation":
-            reward_view = build_manipulation_reward_view(unwrapped, obs, action, info, env_reward, terminated)
-        elif self._env_family == "reach":
-            # Pass the raw MetaWorld env to the LLM reward, mirroring the original
-            # Eureka behaviour where the reward function sees the full env class.
-            reward_view = unwrapped
-        elif self._env_family == "pick":
-            # Pass the raw MetaWorld env to the LLM reward, mirroring the original
-            # Eureka behaviour where the reward function sees the full env class.
-            reward_view = unwrapped
-        elif self._env_family == "door":
-            # Pass the raw MetaWorld env to the LLM reward, mirroring the original
-            # Eureka behaviour where the reward function sees the full env class.
-            reward_view = unwrapped
-        elif self._env_family == "geometric_control":
-            reward_view = build_geometric_control_reward_view(unwrapped, obs, action, info, env_reward, terminated)
-        elif self._env_family == "walker":
-            # Pass the raw MuJoCo env to the LLM reward, mirroring the original
-            # Eureka behaviour where the reward function sees the full env class.
-            reward_view = unwrapped
-        elif self._env_family == "ant":
-            # Pass the raw MuJoCo env to the LLM reward, mirroring the original
-            # Eureka behaviour where the reward function sees the full Task class.
-            reward_view = unwrapped
-        else:
-            reward_view = build_reward_view(unwrapped, obs, action, info, env_reward, terminated)
 
-        if prev_x is None and self._env_family in {"locomotion", "walker", "ant"}:
+        if prev_x is None and self._env_family in {"walker", "ant"}:
             x_velocity = float(getattr(unwrapped, "x_velocity", info.get("x_velocity", 0.0)))
             dt = float(getattr(unwrapped, "dt", 1.0))
             self._episode_forward_displacement += x_velocity * dt
@@ -89,7 +58,7 @@ class RewardOverrideWrapper(gym.Wrapper):
             self._last_x = cur_x
 
         try:
-            gpt_reward, reward_dict = self._gpt_reward_fn(reward_view, obs, action)
+            gpt_reward, reward_dict = self._gpt_reward_fn(unwrapped, obs, action)
         except Exception as e:
             raise RuntimeError(f"GPT reward function crashed: {e!r}") from e
 
@@ -103,7 +72,7 @@ class RewardOverrideWrapper(gym.Wrapper):
         info["gpt_reward"] = float(gpt_reward)
         info["gt_reward"] = float(gt_reward)
         info["task_score"] = float(gt_reward)
-        if self._env_family in {"manipulation", "reach", "pick", "door"}:
+        if self._env_family in {"reach", "pick", "door"}:
             info["consecutive_successes"] = float(gt_reward)
 
         if isinstance(reward_dict, dict):
@@ -115,3 +84,4 @@ class RewardOverrideWrapper(gym.Wrapper):
 
         self._last_obs = obs
         return obs, float(gpt_reward), terminated, truncated, info
+

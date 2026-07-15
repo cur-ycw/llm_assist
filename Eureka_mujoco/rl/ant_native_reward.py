@@ -2,13 +2,18 @@
 
 Matches the reward used by `eureka/envs/mujoco/ant_v4.py`:
     reward = x_velocity + healthy_reward - control_cost
+
+The first argument is the raw MuJoCo AntEnv (post-`unwrapped`), matching the
+raw-env contract used by RewardOverrideWrapper.
 """
 
 
 def compute_reward(env, obs, action):
-    x_velocity = float(env.x_velocity)
+    # Ant-v4 exposes x_velocity via the step()-produced info dict, not as an
+    # attribute; the wrapper also mirrors it via qvel[0] on the raw env.
+    x_velocity = float(env.data.qvel[0])
     healthy_reward = float(env.healthy_reward)
-    control_cost = float(env.control_cost)
+    control_cost = float(env.control_cost(action))
     reward = x_velocity + healthy_reward - control_cost
     return reward, {
         "forward_reward": x_velocity,

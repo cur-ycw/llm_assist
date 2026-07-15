@@ -19,7 +19,6 @@ if [ -d "$ISAACGYM_PATH/python" ]; then
     export LD_LIBRARY_PATH="$ISAACGYM_PATH/python/isaacgym/_bindings/linux-x86_64:${LD_LIBRARY_PATH:-}"
 fi
 
-# IsaacGym's C++ bindings dlopen libpython3.8.so.1.0 at import time.
 if [ -n "$CONDA_PREFIX" ] && [ -f "$CONDA_PREFIX/lib/libpython3.8.so.1.0" ]; then
     export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 fi
