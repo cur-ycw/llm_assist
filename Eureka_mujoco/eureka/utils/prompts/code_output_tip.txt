@@ -1,0 +1,10 @@
+The output of the reward function should consist of two items:
+    (1) the total reward (a single Python float),
+    (2) a dictionary of each individual reward component (string -> float).
+The code output should be formatted as a Python code string: "```python ... ```".
+
+Some helpful tips for writing the reward function code:
+    (1) You may find it helpful to normalize a reward component by applying a transformation like `np.exp(x / T)` where T is a temperature.
+    (2) If you choose to transform a reward component, you must also introduce a temperature parameter inside the transformation function; this parameter must be a named variable in the reward function and it must not be an input variable. Each transformed reward component should have its own temperature variable.
+    (3) Make sure your `compute_reward` is a top-level function and only uses `env`, `obs`, `action` as inputs. Do not introduce new input arguments.
+    (4) Only use attributes exposed on the provided reward view — do not introduce new state, do not assign attributes to `env`, and do not rely on values persisted across calls.

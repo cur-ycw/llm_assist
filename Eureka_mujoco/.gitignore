@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Local env
+.env
+.env.local
+env.local.sh
+
+# Experiment artifacts
+eureka/outputs/
+run_logs/
+baseline_outputs/
+tmp_*
+relaunch_*.log
+*.log
+
+# Editor
+.vscode/
+.idea/
+.claude/
+
+# Smoke test working dirs
+smoke/

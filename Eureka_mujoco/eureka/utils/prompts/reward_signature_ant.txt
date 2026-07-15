@@ -1,0 +1,3 @@
+def compute_reward(env, obs: "np.ndarray", action: "np.ndarray") -> "Tuple[float, Dict[str, float]]":
+    ...
+    return reward, {}

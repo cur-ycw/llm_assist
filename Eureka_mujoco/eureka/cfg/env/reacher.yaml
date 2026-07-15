@@ -1,0 +1,4 @@
+task: Reacher
+env_name: reach-v3
+description: to move the robot hand to the target position as quickly and accurately as possible
+env_parent: metaworld

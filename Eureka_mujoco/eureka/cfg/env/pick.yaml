@@ -1,0 +1,4 @@
+task: Pick
+env_name: sawyer_pick_place_v3
+description: to pick up an object and place it at a target position
+env_parent: metaworld

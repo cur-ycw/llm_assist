@@ -1,0 +1,4 @@
+task: Walker
+env_name: walker2d_v4
+description: to make the walker run forward as fast as possible while staying upright
+env_parent: mujoco

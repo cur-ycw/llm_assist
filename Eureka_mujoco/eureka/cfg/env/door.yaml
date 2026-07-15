@@ -1,0 +1,4 @@
+task: Door
+env_name: sawyer_door_v3
+description: to open a door by grasping its handle and pulling it open
+env_parent: metaworld

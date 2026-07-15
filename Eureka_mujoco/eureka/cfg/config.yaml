@@ -1,0 +1,26 @@
+defaults:
+  - _self_
+  - env: ant
+  - override hydra/launcher: basic
+  - override hydra/output: default
+
+hydra:
+  job:
+    chdir: True
+
+# LLM parameters (chatanywhere proxy; gpt-4-0314 unavailable on this endpoint)
+model: gpt-4o-2024-08-06
+temperature: 1.0
+suffix: GPT
+
+# Eureka parameters
+iteration: 5
+sample: 16
+max_iterations: 1000000  # PPO total_timesteps per RL sample
+num_eval: 5
+n_envs: 8
+
+# Weights and Biases (off by default; SB3 doesn't auto-log to wandb here)
+use_wandb: False
+wandb_username: ""
+wandb_project: ""

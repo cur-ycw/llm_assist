@@ -1,0 +1,4 @@
+task: Ant
+env_name: ant_v4
+description: to make the ant run forward as fast as possible
+env_parent: mujoco
