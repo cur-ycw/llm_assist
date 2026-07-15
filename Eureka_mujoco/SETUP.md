@@ -143,15 +143,29 @@ accordingly.
 
 ## 7. Run a real Eureka experiment
 
-Once the smoke passes:
+Per-task launchers live under `scripts/`. Each pins the PPO budget expected
+for that task family:
+
+| Task   | Launcher                | Per-sample PPO steps |
+|--------|-------------------------|----------------------|
+| Ant    | `scripts/run_ant.sh`    | 5,000,000 (MuJoCo)   |
+| Walker | `scripts/run_walker.sh` | 5,000,000 (MuJoCo)   |
+| Reach  | `scripts/run_reach.sh`  | 10,000,000 (MetaWorld) |
+| Pick   | `scripts/run_pick.sh`   | 10,000,000 (MetaWorld) |
+| Door   | `scripts/run_door.sh`   | 10,000,000 (MetaWorld) |
 
 ```bash
-# Single task
-bash run_eureka_mujoco.sh walker 16 5 5000000
-#                          ^env  ^n_samples ^n_iter ^ppo_steps
+# Single task with defaults (sample=16, iteration=5)
+./scripts/run_walker.sh
 
-# All five tasks in sequence
-bash run_all_tasks.sh
+# Override sample count and iteration count if you want a shorter probe
+./scripts/run_walker.sh 4 2
+
+# Full arbitrary override still works via the underlying driver
+./run_eureka_mujoco.sh walker 16 5 5000000
+
+# All five tasks in sequence using the per-task budgets above
+./run_all_tasks.sh
 ```
 
 The Hydra workspace lands under `eureka/outputs/eureka/<env>_<timestamp>/`

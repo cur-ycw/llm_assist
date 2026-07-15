@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
-# Run all 5 MuJoCo/MetaWorld tasks SEQUENTIALLY at production scale.
-# Each task gets one full EUREKA run (sample=16 x iter=5 x max_iter=1M).
-# Estimated total: 50-75h wall on 3x RTX 3090.
+# Run all 5 MuJoCo/MetaWorld tasks SEQUENTIALLY at production scale using the
+# per-task budgets defined in ./scripts/run_*.sh:
+#   Ant / Walker  (MuJoCo)     : max_iterations = 5M PPO steps per sample
+#   Reach / Pick / Door (MW)   : max_iterations = 10M PPO steps per sample
 #
-# To run in parallel across tasks (faster but more GPU memory), launch each
-# `./run_eureka_mujoco.sh <env>` in its own tmux/screen.
+# One full EUREKA run per task (default: sample=16, iteration=5).
+#
+# To run tasks in parallel across GPUs, launch each ./scripts/run_<task>.sh in
+# its own tmux/screen instead of using this driver.
 set -euo pipefail
 
-cd /root/ycw/Eureka_mujoco
+cd "$(dirname "$0")"
 
-LOG_DIR=/root/ycw/Eureka_mujoco/run_logs
+LOG_DIR=./run_logs
 mkdir -p "$LOG_DIR"
 TS=$(date +%Y%m%d_%H%M%S)
 SUMMARY="$LOG_DIR/all_tasks_${TS}.log"
 echo "[launcher] running all 5 tasks sequentially. summary: $SUMMARY" | tee "$SUMMARY"
 
-for ENV_NAME in ant walker reacher door pick; do
-    echo "[launcher] >>> starting $ENV_NAME at $(date)" | tee -a "$SUMMARY"
-    ./run_eureka_mujoco.sh "$ENV_NAME" 16 5 1000000 2>&1 | tee -a "$SUMMARY"
-    echo "[launcher] <<< finished $ENV_NAME at $(date)" | tee -a "$SUMMARY"
+for TASK in ant walker reach pick door; do
+    echo "[launcher] >>> starting $TASK at $(date)" | tee -a "$SUMMARY"
+    ./scripts/run_${TASK}.sh 2>&1 | tee -a "$SUMMARY"
+    echo "[launcher] <<< finished $TASK at $(date)" | tee -a "$SUMMARY"
 done
 
 echo "[launcher] all 5 tasks done at $(date)" | tee -a "$SUMMARY"
