@@ -1,0 +1,23 @@
+# 官方外部大资产，不纳入 llm_assist（可从 eureka-research/Eureka 重新获取）
+/isaacgymenvs/
+/rl_games/
+/isaacgym/
+/images/
+/LICENSE
+/README.md
+/setup.py
+
+# Python 产物
+outputs/
+**/__pycache__/
+*.egg-info/
+*.pyc
+wandb
+
+# SMC / Eureka 运行产物
+eureka/multirun/
+eureka/candidates/
+eureka/heldout/
+eureka/*.jsonl
+eureka/best_reward_code.py
+eureka/*.npz

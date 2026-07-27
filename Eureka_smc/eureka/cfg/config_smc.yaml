@@ -1,0 +1,25 @@
+defaults:
+  - _self_
+  - env: cartpole          # Batch-2 bring-up 任务
+  - algo: smc
+  - override hydra/launcher: local
+  - override hydra/output: local
+
+hydra:
+  job:
+    chdir: True
+
+# LLM 参数
+model: gpt-4o-2024-08-06   # chatanywhere 代理；gpt-4-0314 在该端点不可用
+temperature: 1.0
+suffix: GPT
+
+# RL 训练参数
+policy_train_iterations: 3000  # 每个候选的 PPO 训练步数（原 max_iterations 改名，避免与 SMC iteration 混淆）
+num_eval: 5                    # 最终 held-out 复评次数（兼容旧 Eureka）
+capture_video: False
+
+# Weights and Biases
+use_wandb: False
+wandb_username: ""
+wandb_project: ""
