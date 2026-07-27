@@ -2,3 +2,10 @@ task: FrankaCabinet
 env_name: franka_cabinet
 description: to open the cabinet door
 max_iterations: 1500
+
+# search_score 归一化界（任务相关，覆盖 algo.score 的全局 fallback）。
+# FrankaCabinet 的 consecutive_successes = 成功 env 占比 ∈ [0,1]（franka_cabinet.py:571-575，
+# 抽屉 cabinet_dof_pos[:,3]>0.39 记 1，跨 env 求均值），天花板=1，无需定标。
+score_metric: consecutive_successes
+score_lower: 0.0
+score_upper: 1.0

@@ -93,10 +93,19 @@ def main(cfg):
 
     # ---- 装配 SMC 组件 ----
     algo = cfg.algo
+    # search_score 的归一化上/下界是**任务相关**的（consecutive_successes 在 FrankaCabinet
+    # 是成功 env 占比 ∈[0,1] → upper=1；在手部任务是连续达标计数 → upper≈50；gt_reward 回退
+    # 任务是回合回报 → 上千甚至为负）。故优先取 env 配置里的 score_upper/score_lower，
+    # 缺省才用 algo.score 的全局 fallback。metric 同理可按任务覆盖。
+    score_metric = cfg.env.get("score_metric", algo.score.metric)
+    score_lower = cfg.env.get("score_lower", algo.score.lower)
+    score_upper = cfg.env.get("score_upper", algo.score.upper)
+    logging.info(f"Score: metric={score_metric}, lower={score_lower}, upper={score_upper} "
+                 f"(env override: {'score_upper' in cfg.env})")
     score_cfg = ScoreConfig(
-        metric=algo.score.metric, fallback_metric=algo.score.fallback_metric,
+        metric=score_metric, fallback_metric=algo.score.fallback_metric,
         aggregate=algo.score.aggregate, window_frac=algo.score.window_frac,
-        lower=algo.score.lower, upper=algo.score.upper)
+        lower=score_lower, upper=score_upper)
 
     eval_cfg = IsaacGymEvalConfig(
         isaac_root_dir=ISAAC_ROOT_DIR, eureka_root_dir=EUREKA_ROOT_DIR, task=task,
@@ -109,9 +118,11 @@ def main(cfg):
                       code_output_tip=prompts["code_output_tip"], model=cfg.model,
                       temperature=cfg.temperature)
     proposer = EurekaReflectionProposer(ctx, openai)
+    max_concurrent = algo.evaluation.get("max_concurrent_evals", 6)
     evaluator = IsaacGymEvaluator(
         score_cfg, seeds=list(algo.evaluation.search_seed_panel),
-        prompts=prompts, eval_cfg=eval_cfg, cache=algo.evaluation.cache)
+        prompts=prompts, eval_cfg=eval_cfg, cache=algo.evaluation.cache,
+        max_concurrent=max_concurrent)
 
     island = SMCIsland(
         SMCIslandConfig(
@@ -142,7 +153,8 @@ def main(cfg):
     heldout = list(algo.evaluation.heldout_seed_panel)
     logging.info(f"Held-out re-evaluation on seeds {heldout}")
     heldout_eval = IsaacGymEvaluator(score_cfg, seeds=heldout, prompts=prompts,
-                                     eval_cfg=eval_cfg, cache=False)
+                                     eval_cfg=eval_cfg, cache=False,
+                                     max_concurrent=max_concurrent)
     rec = heldout_eval.evaluate(result.best.reward_code, "heldout",
                                 workspace_dir / "heldout")
     per_seed = rec.reward_components.get("per_seed_normalized", [])

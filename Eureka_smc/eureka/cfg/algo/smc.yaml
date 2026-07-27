@@ -4,7 +4,7 @@
 
 authority_mode: paper_core   # paper_core | source_compat
 n_islands: 1                 # 首版单岛
-n_particles: 8               # 每岛粒子数 N
+n_particles: 16              # 每岛粒子数 N（16：init 池更大、且 β=2 落在 ln16≈2.77 坍缩余量内）
 beta_target: 2.0             # 终端逆温 beta_target（Batch-1 推荐，避免坍缩）
 kappa: 0.5                   # ESS 阈值系数（标准 SMC ~0.5，而非计划初稿的 0.9）
 min_smc_iterations: 3        # max_delta_lambda = 1/min_smc_iterations
@@ -14,17 +14,24 @@ max_init_retries: 3          # 初始无效粒子补采样上限（相对 N）
 seed: 0                      # 岛屿 RNG 种子
 migration_enabled: false     # 粒子迁移仅 source_compat 开启
 
-# search_score 提取与归一化（计划 §5）
+# search_score 提取与归一化（计划 §5）。
+# 注意：lower/upper 是**任务相关**的归一化界，应在各 env 配置里用 score_lower/score_upper
+# 覆盖（如 franka_cabinet.yaml: upper=1，因其 consecutive_successes 是成功率 ∈[0,1]）。
+# 这里的值仅作缺省 fallback。
 score:
   metric: consecutive_successes
   fallback_metric: gt_reward
   aggregate: final_window_mean   # 非 max：避免乐观高方差选择偏差（审查 #4）
   window_frac: 0.1
   lower: 0.0
-  upper: 500.0                    # Cartpole max_episode_length 占位；pilot 后冻结
+  upper: 1.0                      # fallback：成功率类任务的天花板；回报类任务须在 env 覆盖
 
-# 评估（计划 §5.2）
+# 评估（计划 §5.2）。
+# 搜索阶段单 seed(42) 评估每个奖励——与 Eureka 协议一致、预算公平；该 seed 上的表现即
+# 定义为奖励的 search_score，不额外多 seed 降噪(太烧预算)。所有候选共享同一 seed=CRN，
+# 使分数差值更多反映奖励本身而非 seed 运气。仅最后对最优/top-k 用 heldout 多 seed 复评。
 evaluation:
-  search_seed_panel: [0, 1, 2]                 # 所有候选共享的冻结 CRN panel
-  heldout_seed_panel: [100, 101, 102, 103, 104]  # 与搜索 panel 完全不重叠
+  search_seed_panel: [42]                          # 单 seed 搜索(固定 CRN)，与 Eureka 一致
+  heldout_seed_panel: [100, 101, 102, 103, 104]    # 最后复评，与搜索 seed 完全不重叠
   cache: true
+  max_concurrent_evals: 6                           # 每波并发 train.py 上限（3×3090 下 6≈每卡 2 个，给显存留余量）

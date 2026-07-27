@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -82,6 +84,7 @@ class EurekaReflectionProposer:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.n_calls = 0
+        self._counter_lock = threading.Lock()  # reflect_batch 并发下保护计数器
 
     # ---- LLM 调用（带重试，镜像官方 eureka.py:89-115）----
     def _chat(self, messages: list[dict], n: int) -> list[str]:
@@ -110,9 +113,10 @@ class EurekaReflectionProposer:
                     time.sleep(1)
             if resp is None:
                 raise RuntimeError(f"LLM call failed after {self.max_attempts} attempts")
-            self.n_calls += 1
-            self.total_prompt_tokens += resp["usage"]["prompt_tokens"]
-            self.total_completion_tokens += resp["usage"]["completion_tokens"]
+            with self._counter_lock:  # reflect_batch 线程池并发时保护累加
+                self.n_calls += 1
+                self.total_prompt_tokens += resp["usage"]["prompt_tokens"]
+                self.total_completion_tokens += resp["usage"]["completion_tokens"]
             contents.extend(c["message"]["content"] for c in resp["choices"])
         return contents[:n]
 
@@ -129,13 +133,43 @@ class EurekaReflectionProposer:
 
         复刻 Eureka 的四消息范式，但父代是该粒子自身状态而非全局 best。
         """
-        messages = [
+        return extract_reward_code(self._chat(self._reflect_messages(
+            parent_code, parent_feedback), 1)[0])
+
+    def _reflect_messages(self, parent_code: str, parent_feedback: str) -> list[dict]:
+        """Eureka 四消息反思范式（父代=该粒子自身状态）。reflect / reflect_batch 共用。"""
+        return [
             {"role": "system", "content": self.ctx.initial_system},
             {"role": "user", "content": self.ctx.initial_user},
             {"role": "assistant", "content": f"```python\n{parent_code}\n```"},
             {"role": "user", "content": parent_feedback + self.ctx.code_output_tip},
         ]
-        return extract_reward_code(self._chat(messages, 1)[0])
+
+    def reflect_batch(self, items: list[tuple[str, str]]) -> list[Optional[str]]:
+        """并发发出多个**各不相同**的 reflect 提议（伪并行：线程池 + 每个独立 HTTP）。
+
+        ``items`` 为 ``(parent_code, parent_feedback)`` 列表；返回与之对齐的新代码列表
+        （某项 LLM 失败/无法解析 → 该位置为 ``None``，由 island 视作 no-op 保留父代）。
+        初始 16 个用单次 ``n=16`` 调用已并行；这里解决每阶段 16 个**不同 prompt** 的反思
+        本来只能串行发的问题。计数器已加锁，线程安全。
+        """
+        if not items:
+            return []
+
+        def work(it: tuple[str, str]) -> Optional[str]:
+            try:
+                return extract_reward_code(self._chat(
+                    self._reflect_messages(it[0], it[1]), 1)[0])
+            except Exception as e:  # noqa: BLE001 — 单个反思失败降级为 no-op，不拖垮整阶段
+                logger.warning(f"reflect_batch item failed (视作 no-op): {str(e)[:160]}")
+                return None
+
+        results: list[Optional[str]] = [None] * len(items)
+        with ThreadPoolExecutor(max_workers=len(items)) as ex:
+            futs = {ex.submit(work, it): i for i, it in enumerate(items)}
+            for fut in futs:
+                results[futs[fut]] = fut.result()
+        return results
 
 
 class FakeProposer:

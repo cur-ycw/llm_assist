@@ -44,6 +44,15 @@ def _cache_key(reward_code: str, salt: str, seeds: Sequence[int]) -> str:
     return h.hexdigest()
 
 
+def _chunks(seq: list, size: int):
+    """把 seq 切成每块至多 size 个的连续波次（size<=0 视为一整波）。"""
+    if size is None or size <= 0:
+        yield list(seq)
+        return
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 class Evaluator:
     """评估器基类，实现 code-hash 缓存；子类实现 ``_evaluate_uncached``。"""
 
@@ -74,6 +83,16 @@ class Evaluator:
 
     def _evaluate_uncached(self, reward_code, candidate_id, artifact_dir) -> EvalRecord:
         raise NotImplementedError
+
+    def evaluate_batch(self, items: Sequence[tuple]) -> list[EvalRecord]:
+        """批量评估。默认**串行**兜底：逐个走带缓存的 ``evaluate``。
+
+        供 ``FakeEvaluator`` 等测试替身使用——保持与旧逐粒子路径完全一致的 RNG 消费顺序
+        （每个 evaluator 的 rng 仍按 0..N-1 顺序被调用）、缓存命中与 ``n_evals`` 语义，因此
+        island 改批量后 Fake 集成测试的确定性不变。``IsaacGymEvaluator`` 覆盖为分波并发。
+        ``items`` 为 ``(reward_code, candidate_id, artifact_dir)`` 列表，返回对齐的记录。
+        """
+        return [self.evaluate(code, cid, d) for code, cid, d in items]
 
 
 # --------------------------------------------------------------------------- fake
@@ -133,15 +152,19 @@ class IsaacGymEvalConfig:
 class IsaacGymEvaluator(Evaluator):
     """真实评估器：注入奖励代码 → 训练 → 解析 tensorboard → 构造反馈。
 
-    首版**串行**执行（计划 §6.9）：所有候选共享同一 ``output_file``，靠“写文件→启动子
-    进程→阻塞到训练开始（模块已导入）”的顺序保证安全。并发隔离留到后续批次。
+    ``evaluate``（单个）仍走共享 ``output_file`` 的路径；``evaluate_batch`` 做**伪并行**：
+    一个驱动进程按“写 output_file → Popen train.py → block_until_training（等它 import 完，
+    非训练结束）→ 写下一个”把一波候选铺开，靠 ``block_until_training`` 门控共享文件写入，
+    再统一 ``communicate`` 收集。``set_freest_gpu`` 每次挑最空卡 → 自动摊到多张 GPU。每波
+    至多 ``max_concurrent`` 个子进程并发，给显存留余量。
     """
 
     def __init__(self, score_cfg, seeds, prompts: Mapping[str, str],
-                 eval_cfg: IsaacGymEvalConfig, cache: bool = True):
+                 eval_cfg: IsaacGymEvalConfig, cache: bool = True, max_concurrent: int = 6):
         super().__init__(score_cfg, seeds, cache)
         self.prompts = prompts
         self.cfg = eval_cfg
+        self.max_concurrent = max_concurrent  # 每波并发子进程上限（3 卡下 6≈每卡 2 个）
 
     def _config_salt(self) -> str:
         c = self.cfg
@@ -183,9 +206,15 @@ class IsaacGymEvaluator(Evaluator):
         return (env + "\nfrom typing import Tuple, Dict\nimport math\nimport torch\n"
                 "from torch import Tensor\n" + body + "\n")
 
-    def _run_one_seed(self, seed: int, artifact_dir: Path, u) -> tuple[Optional[dict], str, str]:
-        """跑一个 seed，返回 (tensorboard_logs|None, stdout_path, traceback_msg)。"""
+    def _launch_seed(self, env_code: str, seed: int, artifact_dir: Path, u):
+        """写共享 output_file → 启动 train.py → block_until_training（等它 import 完）。
+
+        返回 (proc, rl_filepath)。调用者必须在写下一个候选的 output_file **之前**完成本次
+        block_until_training（已在此函数内），从而共享文件写入被串起来、训练本身并发。
+        """
         u["set_freest_gpu"]()
+        with open(self.cfg.output_file, "w") as f:
+            f.write(env_code)
         rl_filepath = str(artifact_dir / f"train_seed{seed}.txt")
         c = self.cfg
         with open(rl_filepath, "w") as f:
@@ -197,6 +226,11 @@ class IsaacGymEvaluator(Evaluator):
                  "force_render=False", f"max_iterations={c.max_iterations}", f"seed={seed}"],
                 stdout=f, stderr=f)
         u["block_until_training"](rl_filepath)
+        return proc, rl_filepath
+
+    @staticmethod
+    def _collect_seed(proc, rl_filepath: str, u) -> tuple[Optional[dict], str, str]:
+        """等一个已启动的 train.py 跑完并解析，返回 (tensorboard_logs|None, stdout_path, tb)。"""
         proc.communicate()
         with open(rl_filepath) as f:
             stdout_str = f.read()
@@ -232,36 +266,25 @@ class IsaacGymEvaluator(Evaluator):
                 content += f"{name}: {series}, Max: {mx:.2f}, Mean: {mean:.2f}, Min: {mn:.2f} \n"
         return content + self.prompts["code_feedback"] + self.prompts["code_output_tip"]
 
-    def _evaluate_uncached(self, reward_code, candidate_id, artifact_dir) -> EvalRecord:
-        t0 = time.time()
-        artifact_dir = Path(artifact_dir) if artifact_dir else Path(f"candidate_{candidate_id}")
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        u = self._utils()
+    def _signature_error_record(self, t0: float) -> EvalRecord:
+        return EvalRecord(
+            search_score=None, valid=False, executable=False,
+            feedback=self.prompts["execution_error_feedback"].format(
+                traceback_msg="Cannot parse reward function signature! Re-write a new one.")
+            + self.prompts["code_output_tip"],
+            error="signature_parse_error", wall_time_s=time.time() - t0)
 
-        env_code = self._inject(reward_code, u)
-        if env_code is None:
-            return EvalRecord(
-                search_score=None, valid=False, executable=False,
-                feedback=self.prompts["execution_error_feedback"].format(
-                    traceback_msg="Cannot parse reward function signature! Re-write a new one.")
-                + self.prompts["code_output_tip"],
-                error="signature_parse_error", wall_time_s=time.time() - t0)
-
-        # 写共享 output_file + artifact 副本（串行下安全）
-        with open(self.cfg.output_file, "w") as f:
-            f.write(env_code)
+    def _aggregate(self, seed_results: dict, artifact_dir: Path, t0: float) -> EvalRecord:
+        """把一个候选各 seed 的运行结果聚合成 EvalRecord（原 _evaluate_uncached 尾部逻辑）。"""
         env_copy = str(artifact_dir / "env_code.py")
-        with open(env_copy, "w") as f:
-            f.write(env_code)
-
         per_seed_norm: list[float] = []
         gpt_rewards: list[float] = []
         raw_first: Optional[float] = None
         feedback = ""
-        tb_dirs, stdout_paths = [], []
+        stdout_paths: list[str] = []
         last_tb = ""
         for seed in self.seeds:
-            logs, stdout_path, tb = self._run_one_seed(seed, artifact_dir, u)
+            logs, stdout_path, tb = seed_results.get(seed, (None, "", "no_result"))
             stdout_paths.append(stdout_path)
             if logs is None:
                 last_tb = tb
@@ -291,5 +314,82 @@ class IsaacGymEvaluator(Evaluator):
             raw_metrics={"raw_first_seed": raw_first, "search_score": score,
                          "gpt_reward_mean": float(np.mean(gpt_rewards)) if gpt_rewards else None},
             reward_components={"per_seed_normalized": per_seed_norm},
-            env_code_path=env_copy, tensorboard_dirs=tuple(tb_dirs),
-            stdout_paths=tuple(stdout_paths), wall_time_s=time.time() - t0)
+            env_code_path=env_copy, stdout_paths=tuple(stdout_paths),
+            wall_time_s=time.time() - t0)
+
+    def _run_candidates(self, specs: list[tuple]) -> dict:
+        """伪并行执行一批候选（specs=[(key, code, artifact_dir)]），返回 {key: EvalRecord}。
+
+        对每个候选注入奖励代码；把所有 (候选×seed) 展平成 launch unit，按 max_concurrent
+        分波：一波内串行 launch（写共享 output_file→Popen→block_until_training 门控），再统一
+        collect。写入被 block_until_training 串起来，训练本身并发；set_freest_gpu 摊到多卡。
+        不处理缓存/n_evals（由调用方负责）。
+        """
+        u = self._utils()
+        env_by_key: dict = {}
+        dir_by_key: dict = {}
+        t0_by_key: dict = {}
+        recs: dict = {}
+        for key, code, d in specs:
+            d = Path(d) if d else Path(f"candidate_{key[:8]}")
+            d.mkdir(parents=True, exist_ok=True)
+            dir_by_key[key], t0_by_key[key] = d, time.time()
+            env_code = self._inject(code, u)
+            env_by_key[key] = env_code
+            if env_code is None:
+                recs[key] = self._signature_error_record(t0_by_key[key])
+            else:
+                with open(d / "env_code.py", "w") as f:
+                    f.write(env_code)
+
+        runnable = [key for key, _, _ in specs if env_by_key[key] is not None]
+        seed_results: dict = {key: {} for key in runnable}
+        units = [(key, seed) for key in runnable for seed in self.seeds]
+        for wave in _chunks(units, self.max_concurrent):
+            launched = []
+            for key, seed in wave:  # 串行 launch：写→启动→等 import（门控共享文件）
+                proc, rl = self._launch_seed(env_by_key[key], seed, dir_by_key[key], u)
+                launched.append((key, seed, proc, rl))
+            for key, seed, proc, rl in launched:  # 统一 collect：并发训练在此汇合
+                seed_results[key][seed] = self._collect_seed(proc, rl, u)
+
+        for key in runnable:
+            recs[key] = self._aggregate(seed_results[key], dir_by_key[key], t0_by_key[key])
+        return recs
+
+    def _evaluate_uncached(self, reward_code, candidate_id, artifact_dir) -> EvalRecord:
+        """单候选评估（heldout / 无 batch 路径用）：多 seed 也会分波并发。"""
+        artifact_dir = Path(artifact_dir) if artifact_dir else Path(f"candidate_{candidate_id}")
+        key = _cache_key(reward_code, self._config_salt(), self.seeds)
+        return self._run_candidates([(key, reward_code, artifact_dir)])[key]
+
+    def evaluate_batch(self, items: Sequence[tuple]) -> list[EvalRecord]:
+        """伪并行批量评估。命中缓存的直接复用；未命中的按 code 去重后一起分波并发。
+
+        与基类串行兜底同接口（items=[(code, cid, artifact_dir)]），但 IsaacGym 下把整批
+        （及各自的 seed panel）铺开到多卡并发。缓存写入、``n_evals`` 累加在此完成，语义与
+        单个 ``evaluate`` 一致（每个**唯一未命中** code 记 1 次真实评估）。
+        """
+        results: list[Optional[EvalRecord]] = [None] * len(items)
+        specs_by_key: dict = {}          # key -> (code, artifact_dir)  去重
+        idx_by_key: dict = {}            # key -> [item indices]
+        for i, (code, cid, d) in enumerate(items):
+            key = _cache_key(code, self._config_salt(), self.seeds)
+            if self._cache_enabled and key in self._cache:
+                results[i] = self._cache[key]
+                continue
+            idx_by_key.setdefault(key, []).append(i)
+            specs_by_key.setdefault(key, (code, Path(d) if d else Path(f"candidate_{cid}")))
+
+        if specs_by_key:
+            specs = [(key, code, d) for key, (code, d) in specs_by_key.items()]
+            computed = self._run_candidates(specs)
+            for key, rec in computed.items():
+                rec.cache_key = key
+                rec.train_seeds = self.seeds
+                self.n_evals += 1
+                if self._cache_enabled:
+                    self._cache[key] = rec
+                for i in idx_by_key[key]:
+                    results[i] = rec
+        return results  # type: ignore[return-value]

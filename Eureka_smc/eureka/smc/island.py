@@ -87,47 +87,71 @@ class SMCIsland:
             if self.best is None or p.search_score > (self.best.search_score or -np.inf):
                 self.best = p
 
-    def _make_particle(self, code: str, generation: int, *, proposal_parent_id,
-                       accepted_transition_parent_id, clone_ancestor_id,
-                       state_origin_id: Optional[str] = None) -> RewardParticle:
-        pid = self._next_id()
-        rec: EvalRecord = self.evaluator.evaluate(code, pid, self._artifact(pid))
-        p = RewardParticle(
-            id=pid, reward_code=code, eval=rec, island_id=self.cfg.island_id,
-            generation=generation, proposal_parent_id=proposal_parent_id,
-            accepted_transition_parent_id=accepted_transition_parent_id,
-            clone_ancestor_id=clone_ancestor_id, artifact_dir=self._artifact(pid),
-        )
-        p.metadata["state_origin_id"] = state_origin_id or pid
-        self.log.log("eval", id=pid, valid=rec.valid, search_score=rec.search_score,
-                     generation=generation, proposal_parent_id=proposal_parent_id,
-                     accepted_transition_parent_id=accepted_transition_parent_id,
-                     clone_ancestor_id=clone_ancestor_id)
-        self._consider_best(p)
-        return p
+    def _reflect_many(self, items: list[tuple[str, str]]) -> list[Optional[str]]:
+        """并发反思（真实 proposer 有 reflect_batch）；否则串行兜底（Fake/测试保持确定性）。"""
+        if hasattr(self.proposer, "reflect_batch"):
+            return self.proposer.reflect_batch(items)
+        return [self.proposer.reflect(code, fb) for code, fb in items]
+
+    def _make_particles_batch(self, specs: list[dict]) -> list[RewardParticle]:
+        """给一批代码分配 id → 一次 ``evaluate_batch`` 并发评估 → 构造粒子（顺序对齐）。
+
+        ``specs`` 每项含 code + provenance 字段；id 按 specs 顺序分配（``_next_id`` 仅自增
+        计数器、不消费 rng），evaluate_batch 对齐返回，因此每个 evaluator 的 rng 仍按
+        0..N-1 顺序被消费——与旧逐粒子路径等价，Fake 集成测试确定性不变。
+        """
+        if not specs:
+            return []
+        ids = [self._next_id() for _ in specs]
+        dirs = [self._artifact(pid) for pid in ids]
+        items = [(s["code"], pid, d) for s, pid, d in zip(specs, ids, dirs)]
+        recs = self.evaluator.evaluate_batch(items)
+        particles: list[RewardParticle] = []
+        for s, pid, d, rec in zip(specs, ids, dirs, recs):
+            p = RewardParticle(
+                id=pid, reward_code=s["code"], eval=rec, island_id=self.cfg.island_id,
+                generation=s["generation"], proposal_parent_id=s.get("proposal_parent_id"),
+                accepted_transition_parent_id=s.get("accepted_transition_parent_id"),
+                clone_ancestor_id=s.get("clone_ancestor_id"), artifact_dir=d,
+            )
+            p.metadata["state_origin_id"] = s.get("state_origin_id") or pid
+            self.log.log("eval", id=pid, valid=rec.valid, search_score=rec.search_score,
+                         generation=s["generation"], proposal_parent_id=s.get("proposal_parent_id"),
+                         accepted_transition_parent_id=s.get("accepted_transition_parent_id"),
+                         clone_ancestor_id=s.get("clone_ancestor_id"))
+            self._consider_best(p)
+            particles.append(p)
+        return particles
 
     # ---- 初始化（计划 §6.1）----
     def initialize(self) -> list[RewardParticle]:
         n = self.cfg.n_particles
         particles: list[RewardParticle] = []
         budget = n + self.cfg.max_init_retries * n
-        codes = list(self.proposer.initial_batch(n))
+        codes = list(self.proposer.initial_batch(n))  # 单次 n= 调用，服务端并行
         attempts = 0
         while len(particles) < n and attempts < budget:
+            need = n - len(particles)
             if not codes:
-                codes = list(self.proposer.initial_batch(n - len(particles)))
-            code = codes.pop()
-            attempts += 1
-            if code is None:
+                codes = list(self.proposer.initial_batch(need))
+            batch_codes: list[str] = []
+            while codes and len(batch_codes) < need and attempts < budget:
+                code = codes.pop()
+                attempts += 1
+                if code is None:
+                    continue
+                batch_codes.append(code)
+            if not batch_codes:
                 continue
-            p = self._make_particle(code, generation=0, proposal_parent_id=None,
-                                    accepted_transition_parent_id=None, clone_ancestor_id=None)
-            if p.valid:
-                particles.append(p)
-            else:
-                self.log.log("init_invalid", id=p.id)
+            new_particles = self._make_particles_batch(
+                [dict(code=c, generation=0) for c in batch_codes])  # 一波并发评估
+            for p in new_particles:
+                if p.valid:
+                    particles.append(p)
+                else:
+                    self.log.log("init_invalid", id=p.id)
         self.log.log("init_done", n_valid=len(particles), attempts=attempts)
-        return particles
+        return particles[:n]
 
     # ---- 一个退火阶段（计划 §6.3、§6.6）----
     def _stage(self, particles: list[RewardParticle], lam_prev: float,
@@ -147,7 +171,7 @@ class SMCIsland:
                      rewards=rewards.tolist())
 
         # clone 重采样父代 → 新粒子群（clone 不重新评估，复制父的 eval）
-        chain: list[RewardParticle] = []
+        current: list[RewardParticle] = []
         for a in idx:
             parent = particles[int(a)]
             clone = RewardParticle(
@@ -160,37 +184,43 @@ class SMCIsland:
             clone.metadata["state_origin_id"] = parent.metadata.get("state_origin_id", parent.id)
             clone.artifact_dir = parent.artifact_dir
             self.log.log("resample_clone", id=clone.id, ancestor=parent.id)
-            chain.append(self._mutate_chain(clone, beta_t, stage_idx))
-        return chain, lam_next, ess
+            current.append(clone)
 
-    def _mutate_chain(self, current: RewardParticle, beta_t: float, stage_idx: int) -> RewardParticle:
-        """对一个重采样粒子做 K 次 reward-only MH 提议（计划 §6.6）。"""
+        # K 轮（首版 K=1）批量 MH：每轮对所有粒子当前状态**并发** reflect + evaluate，
+        # 再逐粒子接受。轮内 in-place 更新 current[i]，故 K>1 时每粒子链依赖仍正确保留。
         for step in range(self.cfg.n_proposals):
-            child_code = self.proposer.reflect(current.reward_code, current.eval.feedback)
-            if child_code is None or child_code == current.reward_code:
-                self.log.log("proposal_noop", id=current.id, stage=stage_idx, step=step)
-                continue
-            child = self._make_particle(
-                child_code, generation=current.generation,
-                proposal_parent_id=current.id,
-                accepted_transition_parent_id=current.metadata.get("state_origin_id", current.id),
-                clone_ancestor_id=None,
-            )
-            if not child.valid or child.search_score is None:
-                # mutation 无效直接拒绝，保留父代（计划 §4.2）
-                self.log.log("accept_decision", parent=current.id, child=child.id,
-                             stage=stage_idx, step=step, accepted=False, reason="invalid_child")
-                continue
-            delta_r = child.search_score - (current.search_score or 0.0)
-            if delta_r >= 0.0:
-                accept = True
-            else:
-                accept = self.rng.random() < float(np.exp(beta_t * delta_r))
+            child_codes = self._reflect_many(
+                [(c.reward_code, c.eval.feedback) for c in current])
+            specs, slots = [], []
+            for i, (c, child_code) in enumerate(zip(current, child_codes)):
+                if child_code is None or child_code == c.reward_code:
+                    self.log.log("proposal_noop", id=c.id, stage=stage_idx, step=step)
+                    continue
+                specs.append(dict(
+                    code=child_code, generation=c.generation, proposal_parent_id=c.id,
+                    accepted_transition_parent_id=c.metadata.get("state_origin_id", c.id),
+                    clone_ancestor_id=None))
+                slots.append(i)
+            children = self._make_particles_batch(specs)
+            for child, i in zip(children, slots):
+                current[i] = self._mh_accept(current[i], child, beta_t, stage_idx, step)
+        return current, lam_next, ess
+
+    def _mh_accept(self, current: RewardParticle, child: RewardParticle,
+                   beta_t: float, stage_idx: int, step: int) -> RewardParticle:
+        """reward-only MH 接受（计划 §6.6）：ΔR≥0 必接受；否则以 exp(β_t·ΔR) 概率接受。"""
+        if not child.valid or child.search_score is None:
             self.log.log("accept_decision", parent=current.id, child=child.id, stage=stage_idx,
-                         step=step, delta_r=delta_r, beta_t=beta_t, accepted=accept)
-            if accept:
-                current = child  # child 成为下一步提议源
-        return current
+                         step=step, accepted=False, reason="invalid_child")
+            return current
+        delta_r = child.search_score - (current.search_score or 0.0)
+        if delta_r >= 0.0:
+            accept = True
+        else:
+            accept = self.rng.random() < float(np.exp(beta_t * delta_r))
+        self.log.log("accept_decision", parent=current.id, child=child.id, stage=stage_idx,
+                     step=step, delta_r=delta_r, beta_t=beta_t, accepted=accept)
+        return child if accept else current
 
     # ---- 主循环（计划 §6.8）----
     def run(self) -> IslandResult:
