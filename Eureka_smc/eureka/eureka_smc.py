@@ -27,7 +27,24 @@ from smc.proposer import EurekaReflectionProposer, TaskContext
 from smc.score import ScoreConfig
 
 EUREKA_ROOT_DIR = os.getcwd()
-ISAAC_ROOT_DIR = f"{EUREKA_ROOT_DIR}/../isaacgymenvs/isaacgymenvs"
+
+
+def _resolve_isaac_root() -> str:
+    """指向 conda env 实际安装的 isaacgymenvs 包目录。
+
+    关键正确性修复：训练子进程 import 的是已安装的 isaacgymenvs（本机为
+    /root/ycw/Eureka/isaacgymenvs），若 output_file 写到 Eureka_smc 自带的
+    isaacgymenvs，则 reward 注入写读不在同一处、注入根本不生效。用 find_spec
+    定位已安装包，保证写=读。找不到时回退到仓库自带路径。
+    """
+    import importlib.util
+    spec = importlib.util.find_spec("isaacgymenvs")
+    if spec is not None and spec.origin:
+        return os.path.dirname(os.path.abspath(spec.origin))
+    return f"{EUREKA_ROOT_DIR}/../isaacgymenvs/isaacgymenvs"
+
+
+ISAAC_ROOT_DIR = _resolve_isaac_root()
 
 
 @hydra.main(config_path="cfg", config_name="config_smc", version_base="1.1")
@@ -44,8 +61,17 @@ def main(cfg):
     env_name = cfg.env.env_name.lower()
     logging.info(f"SMC-Eureka | task={task} | model={cfg.model}")
 
-    # ---- 任务代码与 obs（同官方 eureka.py:41-66）----
-    env_parent = "isaac" if f"{env_name}.py" in os.listdir(f"{EUREKA_ROOT_DIR}/envs/isaac") else "dexterity"
+    # ---- 任务代码与 obs ----
+    # 本仓库 envs/ 为 isaac(单环境) + bidex(双手 ShadowHand)，官方 eureka.py 硬编码的
+    # dexterity 目录在此不存在，故遍历候选目录定位任务 obs 源码。
+    env_parent = None
+    for cand in ("isaac", "bidex", "dexterity"):
+        d = f"{EUREKA_ROOT_DIR}/envs/{cand}"
+        if os.path.isdir(d) and f"{env_name}.py" in os.listdir(d):
+            env_parent = cand
+            break
+    if env_parent is None:
+        raise FileNotFoundError(f"找不到任务 obs 源码 envs/*/{env_name}.py")
     task_file = f"{EUREKA_ROOT_DIR}/envs/{env_parent}/{env_name}.py"
     task_obs_file = f"{EUREKA_ROOT_DIR}/envs/{env_parent}/{env_name}_obs.py"
     task_code_string = file_to_string(task_file)

@@ -255,6 +255,7 @@ class IsaacGymEvaluator(Evaluator):
             f.write(env_code)
 
         per_seed_norm: list[float] = []
+        gpt_rewards: list[float] = []
         raw_first: Optional[float] = None
         feedback = ""
         tb_dirs, stdout_paths = [], []
@@ -270,6 +271,8 @@ class IsaacGymEvaluator(Evaluator):
                 continue
             raw, norm = sc
             per_seed_norm.append(norm)
+            if "gpt_reward" in logs and len(logs["gpt_reward"]):
+                gpt_rewards.append(float(np.mean(logs["gpt_reward"])))
             if not feedback:  # 用首个成功 seed 构造反馈
                 feedback = self._build_feedback(logs)
                 raw_first = raw
@@ -285,7 +288,8 @@ class IsaacGymEvaluator(Evaluator):
         score = float(np.mean(per_seed_norm))  # panel 聚合：归一化分均值（计划 §5.2）
         return EvalRecord(
             search_score=score, valid=True, executable=True, feedback=feedback,
-            raw_metrics={"raw_first_seed": raw_first, "search_score": score},
+            raw_metrics={"raw_first_seed": raw_first, "search_score": score,
+                         "gpt_reward_mean": float(np.mean(gpt_rewards)) if gpt_rewards else None},
             reward_components={"per_seed_normalized": per_seed_norm},
             env_code_path=env_copy, tensorboard_dirs=tuple(tb_dirs),
             stdout_paths=tuple(stdout_paths), wall_time_s=time.time() - t0)
