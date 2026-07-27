@@ -7,6 +7,9 @@
 /README.md
 /setup.py
 
+# 含明文 API key，不提交
+/env.sh
+
 # Python 产物
 outputs/
 **/__pycache__/

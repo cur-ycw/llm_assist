@@ -75,9 +75,10 @@ class TaskContext:
 class EurekaReflectionProposer:
     """真实 LLM 提议器：初始批量生成 + 单粒子反思重生成。"""
 
-    def __init__(self, ctx: TaskContext, openai_module: Any):
+    def __init__(self, ctx: TaskContext, openai_module: Any, max_attempts: int = 30):
         self.ctx = ctx
         self._openai = openai_module  # 注入 openai 模块，便于测试替换
+        self.max_attempts = max_attempts  # 单次调用的最大重试次数（避免无限重试卡死）
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.n_calls = 0
@@ -88,7 +89,7 @@ class EurekaReflectionProposer:
         contents: list[str] = []
         while len(contents) < n:
             resp = None
-            for attempt in range(1000):
+            for attempt in range(self.max_attempts):
                 try:
                     resp = self._openai.ChatCompletion.create(
                         model=self.ctx.model,
@@ -97,13 +98,18 @@ class EurekaReflectionProposer:
                         n=min(chunk, n - len(contents)),
                     )
                     break
-                except Exception as e:  # noqa: BLE001 — 与官方一致，粗粒度重试
+                except Exception as e:  # noqa: BLE001 — 粗粒度重试
+                    msg = str(e)
+                    # 账户余额/额度不足属不可恢复错误，快速失败并给清晰提示，
+                    # 避免像官方那样对 403 无限重试刷屏卡死。
+                    if any(k in msg for k in ("余额", "balance", "insufficient", "quota")):
+                        raise RuntimeError(f"LLM 额度/余额不足，请充值或更换 key：{msg[:160]}")
                     if attempt >= 10:
                         chunk = max(chunk // 2, 1)
                     logger.info(f"LLM attempt {attempt + 1} failed: {e}")
                     time.sleep(1)
             if resp is None:
-                raise RuntimeError("LLM call failed after too many attempts")
+                raise RuntimeError(f"LLM call failed after {self.max_attempts} attempts")
             self.n_calls += 1
             self.total_prompt_tokens += resp["usage"]["prompt_tokens"]
             self.total_completion_tokens += resp["usage"]["completion_tokens"]
