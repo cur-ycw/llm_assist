@@ -23,12 +23,33 @@ import re
 import sys
 
 # (env_name, native_class_name) —— module = env_name+"gpt"，gpt_class = native+"GPT"
+#
+# 分类依据（扫 compute_success 函数体，客观判据）：
+#   成功率型 = body 里 goal_resets = where(|goal_dist/rot_dist| <= 阈值)  且
+#              resets = where(successes >= max_consecutive_successes) ——
+#              物体真达目标位姿→计连续成功→满 N 重置，consecutive_successes ∈ 有界计数。
+#   得分型   = goal_resets 恒 zeros_like(resets)，reward 由手距+关节进度连续给，
+#              consecutive_successes 非目标驱动 —— 需 soft-clip+专家锚定归一化后再接。
+#
+# DEFAULT = bidex 成功率型 6 个 + 单手 ShadowHand（cube reorientation，亦成功率型）。
 DEFAULT_TASKS = [
-    ("shadow_hand_over",             "ShadowHandOver"),
-    ("shadow_hand_catch_underarm",   "ShadowHandCatchUnderarm"),
-    ("shadow_hand_door_open_outward","ShadowHandDoorOpenOutward"),
-    ("shadow_hand_kettle",           "ShadowHandKettle"),
-    ("shadow_hand",                  "ShadowHand"),   # 单手：桩 shadow_handgpt.py 已存在，仅注册
+    ("shadow_hand_over",               "ShadowHandOver"),
+    ("shadow_hand_catch_underarm",     "ShadowHandCatchUnderarm"),
+    ("shadow_hand_catch_over2underarm","ShadowHandCatchOver2Underarm"),
+    ("shadow_hand_catch_abreast",      "ShadowHandCatchAbreast"),
+    ("shadow_hand_two_catch_underarm", "ShadowHandTwoCatchUnderarm"),
+    ("shadow_hand_re_orientation",     "ShadowHandReOrientation"),
+    ("shadow_hand",                    "ShadowHand"),   # 单手：桩 shadow_handgpt.py 已存在，仅注册
+]
+
+# bidex 得分型（goal_resets 恒 0 / 连续 reward 主导）—— 暂不注册，待归一化方案定后再接。
+SCORE_TYPE_BIDEX = [
+    "shadow_hand_door_open_inward", "shadow_hand_door_open_outward",
+    "shadow_hand_door_close_inward", "shadow_hand_door_close_outward",
+    "shadow_hand_kettle", "shadow_hand_scissors", "shadow_hand_switch",
+    "shadow_hand_bottle_cap", "shadow_hand_swing_cup", "shadow_hand_block_stack",
+    "shadow_hand_grasp_and_place", "shadow_hand_lift_underarm",
+    "shadow_hand_pen", "shadow_hand_push_block", "shadow_hand_two_ball_juggle",
 ]
 
 # bidex 全家桶（--all 用）：env_name -> native class
