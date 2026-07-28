@@ -515,8 +515,21 @@ def compute_success(
                           torch.ones_like(rewards) * -1, rewards)
     
 
-    successes = torch.where(cabinet_dof_pos[:, 3] > 0.39, torch.ones_like(successes), successes)
-    reset_buf = torch.where(cabinet_dof_pos[:, 3] > 0.39, torch.ones_like(reset_buf), reset_buf)
+    # ---- 严苛成功判定 ----
+    # 原判定"抽屉某帧越过 0.39 即成功并立即 reset"太松：不受控的甩/推策略也能蹭过阈值拿满分，
+    # 于是搜索会被"seed 上偶然抓到"的高方差奖励卡住（heldout 双峰 {~1, ~0} 即此现象）。
+    # 收紧为：抽屉开过 0.39 **且** 夹爪正确环住把手（左指在把手上方、右指在下方，且两指都未
+    # 跑到抽屉背后 distX_offset 之外）——即必须"抓着把手拉开"，禁止推/甩。姿态条件复用奖励里
+    # 已有的 around_handle / 反背推逻辑，零新状态、可 jit。
+    opened = cabinet_dof_pos[:, 3] > 0.39
+    grasp_ok = (franka_lfinger_pos[:, 2] > drawer_grasp_pos[:, 2]) \
+        & (franka_rfinger_pos[:, 2] < drawer_grasp_pos[:, 2]) \
+        & (franka_lfinger_pos[:, 0] >= drawer_grasp_pos[:, 0] - distX_offset) \
+        & (franka_rfinger_pos[:, 0] >= drawer_grasp_pos[:, 0] - distX_offset)
+    success_now = opened & grasp_ok
+
+    successes = torch.where(success_now, torch.ones_like(successes), successes)
+    reset_buf = torch.where(success_now, torch.ones_like(reset_buf), reset_buf)
     reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
 
     consecutive_successes = torch.where(reset_buf > 0, successes * reset_buf, consecutive_successes).mean()
