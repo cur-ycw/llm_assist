@@ -188,16 +188,23 @@ class EurekaReflectionProposer:
                 results[futs[fut]] = fut.result()
         return results
 
-    # ---- RF-Agent action 提议（Phase-3a：mutation_structure / mutation_parameter）----
-    def _action_messages(self, parent_code: str, parent_feedback: str, action: str) -> list[dict]:
-        """四消息范式，但第 4 条 user 尾追加 action 专用指令。
+    # ---- RF-Agent action 提议（Phase-3a 变异 m1/m2；Phase-3b 历史 c3/r4/d5）----
+    def _action_messages(self, parent_code: str, parent_feedback: str, action: str,
+                         context: Optional[str] = None) -> list[dict]:
+        """四消息范式，但第 4 条 user 尾追加 action 专用指令（+ 可选历史上下文块）。
 
         指令置于 parent_feedback 之后、code_output_tip 之前——作为模型看到输出格式提醒前的
-        最后一条约束，主导本次改动方向（结构 or 仅参数）。action 未在 action_prompts 中登记
-        时指令为空串，退化为普通反思。
+        最后一条约束，主导本次改动方向。``context`` 是历史型 action（crossover/path/different）
+        的料（供体代码 / 谱系轨迹 / 异谱系意图），由 island 确定性选出；为 None 时该 action
+        退化为普通反思。变异 action（m1/m2）恒无 context，故其消息与 Phase-3a 逐字节一致。
         """
         instr = self.action_prompts.get(action, "")
-        tail = parent_feedback + ("\n" + instr if instr else "") + self.ctx.code_output_tip
+        parts = [parent_feedback]
+        if instr:
+            parts.append(instr)
+        if context:
+            parts.append(context)
+        tail = "\n".join(parts) + self.ctx.code_output_tip
         return [
             {"role": "system", "content": self.ctx.initial_system},
             {"role": "user", "content": self.ctx.initial_user},
@@ -206,22 +213,24 @@ class EurekaReflectionProposer:
         ]
 
     def propose_batch(
-        self, items: list[tuple[str, str, str]]
+        self, items: list[tuple]
     ) -> list[tuple[Optional[str], Optional[str]]]:
         """并发发出 action 路由后的提议（伪并行：线程池 + 每个独立 HTTP）。
 
-        ``items`` 为 ``(parent_code, parent_feedback, action)`` 列表；返回与之对齐的
-        ``(reward_code, design_thought)`` 列表。某项失败/无法解析 → ``(None, None)``（island
-        视作 no-op 保留父代）。design_thought 从同一响应的代码围栏前文本抽取，不额外调 LLM。
+        ``items`` 为 ``(parent_code, parent_feedback, action[, context])`` 列表（context 可选，
+        历史型 action 才有）；返回与之对齐的 ``(reward_code, design_thought)`` 列表。某项失败/
+        无法解析 → ``(None, None)``（island 视作 no-op 保留父代）。design_thought 从同一响应的
+        代码围栏前文本抽取，不额外调 LLM。
         """
         if not items:
             return []
 
-        def work(it: tuple[str, str, str]) -> tuple[Optional[str], Optional[str]]:
-            parent_code, parent_feedback, action = it
+        def work(it: tuple) -> tuple[Optional[str], Optional[str]]:
+            parent_code, parent_feedback, action = it[0], it[1], it[2]
+            context = it[3] if len(it) > 3 else None
             try:
-                content = self._chat(
-                    self._action_messages(parent_code, parent_feedback, action), 1)[0]
+                content = self._chat(self._action_messages(
+                    parent_code, parent_feedback, action, context), 1)[0]
                 return extract_reward_code(content), extract_design_thought(content)
             except Exception as e:  # noqa: BLE001 — 单个提议失败降级为 no-op，不拖垮整阶段
                 logger.warning(f"propose_batch item failed (视作 no-op): {str(e)[:160]}")
@@ -272,12 +281,14 @@ class FakeProposer:
         return self._TEMPLATE.format(q=max(0.0, q))
 
     def propose_batch(
-        self, items: list[tuple[str, str, str]]
+        self, items: list[tuple]
     ) -> list[tuple[Optional[str], Optional[str]]]:
-        """确定性 action 提议兜底：忽略 action 语义（Fake 无领域概念），复用 reflect 的质量
-        改进逻辑，并回一个带 action 标签的合成 design_thought，供 rf 路径集成测试断言。"""
+        """确定性 action 提议兜底：忽略 action 语义与历史 context（Fake 无领域概念），复用
+        reflect 的质量改进逻辑，并回一个带 action 标签的合成 design_thought，供 rf 路径集成
+        测试断言。接受 ``(parent_code, parent_feedback, action[, context])``，context 被忽略。"""
         out: list[tuple[Optional[str], Optional[str]]] = []
-        for parent_code, parent_feedback, action in items:
+        for it in items:
+            parent_code, parent_feedback, action = it[0], it[1], it[2]
             new_code = self.reflect(parent_code, parent_feedback)
             if new_code is None or new_code == parent_code:
                 out.append((new_code, None))  # None / no-op：无 thought

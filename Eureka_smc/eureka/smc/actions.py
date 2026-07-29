@@ -30,9 +30,9 @@ DIFFERENT_THOUGHT = "different_thought"
 RF_ACTIONS = [
     MUTATION_STRUCTURE,   # a_m1：改奖励结构（增删组件 / 改组合、门控、耦合）
     MUTATION_PARAMETER,   # a_m2：固定结构内调参（权重、阈值、温度、clip、scale）
-    CROSSOVER,            # a_c3：横向利用高分 elite（Phase-3b）
-    PATH_REASONING,       # a_r4：纵向总结 accepted-edit 谱系（Phase-3b）
-    DIFFERENT_THOUGHT,    # a_d5：从异谱系历史主动远离（Phase-3b）
+    CROSSOVER,            # a_c3：横向利用高分 elite 供体（Phase-3b）
+    PATH_REASONING,       # a_r4：纵向总结 accepted-edit 谱系轨迹（Phase-3b）
+    DIFFERENT_THOUGHT,    # a_d5：从异谱系设计意图主动远离（Phase-3b）
 ]
 
 
@@ -50,6 +50,8 @@ class ActionConfig:
     enabled: list[str] = field(default_factory=lambda: [MUTATION_STRUCTURE, MUTATION_PARAMETER])
     rf_ratio: list[int] = field(default_factory=lambda: [2, 2, 2, 1, 1])
     gate_contracts: bool = False
+    crossover_k: int = 2   # crossover 提示里展示的高分供体奖励数（Phase-3b）
+    history_k: int = 4     # different_thought 提示里展示的异谱系设计意图条数（Phase-3b）
 
     def __post_init__(self) -> None:
         if self.mode not in ("generic", "rf"):
@@ -60,6 +62,9 @@ class ActionConfig:
         if len(self.rf_ratio) != len(RF_ACTIONS):
             raise ValueError(
                 f"rf_ratio 长度须为 {len(RF_ACTIONS)}（对应 {RF_ACTIONS}），实际 {len(self.rf_ratio)}")
+        if self.crossover_k < 1 or self.history_k < 1:
+            raise ValueError(
+                f"crossover_k/history_k 须 >=1，实际 {self.crossover_k}/{self.history_k}")
 
     def enabled_weights(self) -> list[int]:
         """``enabled`` 中各 action 在 ``RF_ACTIONS`` 里对应的比例权重。"""

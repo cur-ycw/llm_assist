@@ -184,3 +184,64 @@ def test_generic_mode_has_no_action_metadata(tmp_path):
     evs = _events(log_path)
     assert all(e.get("proposal_action") is None for e in evs if e["event"] == "eval")
     assert not any(e["event"] == "contract_audit" for e in evs)
+
+
+# ---- RF-Agent Phase-3b：crossover / path_reasoning / different_thought 历史型 action ----
+
+def _build_rf5(tmp_path: Path, **overrides):
+    from eureka.smc.actions import ActionConfig, RF_ACTIONS
+    cfg = SMCIslandConfig(**{
+        "n_particles": 8, "beta_target": 2.0, "kappa": 0.5,
+        "min_iters": 3, "max_iters": 15, "n_proposals": 1, "seed": 0,
+        "action_cfg": ActionConfig(mode="rf", enabled=list(RF_ACTIONS)),
+        **overrides,
+    })
+    score_cfg = ScoreConfig(lower=0.0, upper=1.0)
+    proposer = FakeProposer(np.random.default_rng(1))
+    evaluator = FakeEvaluator(score_cfg, seeds=(0, 1, 2), rng=np.random.default_rng(2))
+    log_path = tmp_path / "events.jsonl"
+    island = SMCIsland(cfg, proposer, evaluator, EventLogger(log_path, clock=False),
+                       artifact_root=tmp_path / "cand")
+    return island, log_path
+
+
+def test_rf5_routes_all_five_actions_and_completes(tmp_path):
+    island, log_path = _build_rf5(tmp_path)
+    res = island.run()
+    assert res.termination_reason == "annealing_complete"
+    assert res.best is not None and res.best.search_score is not None
+    evs = _events(log_path)
+    acts = {e.get("proposal_action") for e in evs if e["event"] == "eval"}
+    # 三个历史型 action 至少各现身一次（多阶段、N=8、比例含它们）
+    assert {"crossover", "path_reasoning", "different_thought"} <= acts
+    assert {"mutation_structure", "mutation_parameter"} <= acts
+    # 历史型 action 无 AST 契约 → 契约审计只覆盖变异 action
+    audits = [e for e in evs if e["event"] == "contract_audit"]
+    assert all(e["action"] in ("mutation_structure", "mutation_parameter") for e in audits)
+
+
+def test_rf5_registry_populated_and_reproducible(tmp_path):
+    island1, _ = _build_rf5(tmp_path / "a")
+    island2, _ = _build_rf5(tmp_path / "b")
+    r1, r2 = island1.run(), island2.run()
+    # 确定性：料源（注册表选择）与派发均无 rng，同 seed 复现
+    assert r1.best.search_score == pytest.approx(r2.best.search_score)
+    assert r1.n_stages == r2.n_stages
+    # 注册表确实记录了被评估的粒子（供历史型 action 取料）
+    assert len(island1._registry) >= 8
+
+
+def test_rf5_history_context_builders_are_deterministic(tmp_path):
+    # 直接验证三个料源方法确定性、无副作用（跑完一次后在稳定 registry 上重复调用同结果）
+    island, _ = _build_rf5(tmp_path)
+    island.run()
+    reg = list(island._registry.values())
+    assert reg, "registry 非空"
+    # 取一个带 design_thought 的粒子做 different_thought 料源探针
+    donors_a = island._elite_donors(exclude_code="__none__", k=2)
+    donors_b = island._elite_donors(exclude_code="__none__", k=2)
+    assert [p.id for p in donors_a] == [p.id for p in donors_b]  # 确定性
+    assert len(donors_a) <= 2
+    others_a = island._other_thoughts(set(), k=4)
+    others_b = island._other_thoughts(set(), k=4)
+    assert [p.id for p in others_a] == [p.id for p in others_b]

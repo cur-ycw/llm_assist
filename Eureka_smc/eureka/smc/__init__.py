@@ -17,6 +17,7 @@ from .contracts import (
     check_mutation_structure,
     reward_signature,
 )
+from .context import format_crossover, format_different, format_path
 from .event_logger import EventLogger
 from .evaluator import Evaluator, FakeEvaluator, IsaacGymEvalConfig, IsaacGymEvaluator
 from .island import IslandResult, SMCIsland, SMCIslandConfig
@@ -59,6 +60,9 @@ __all__ = [
     "reward_signature",
     "check_mutation_structure",
     "check_mutation_parameter",
+    "format_crossover",
+    "format_path",
+    "format_different",
     # proposer / evaluator
     "TaskContext",
     "extract_reward_code",

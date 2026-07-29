@@ -29,6 +29,7 @@ import numpy as np
 
 from .actions import ActionConfig, assign_actions
 from .contracts import check_mutation_parameter, check_mutation_structure
+from .context import format_crossover, format_different, format_path
 from .event_logger import EventLogger
 from .particle import EvalRecord, RewardParticle
 from .resampling import systematic_resample
@@ -74,6 +75,13 @@ class SMCIsland:
         self.rng = np.random.default_rng(config.seed)
         self._id_counter = 0
         self.best: Optional[RewardParticle] = None  # 与粒子群分离保存的历史最优
+        # RF-Agent 历史型 action（crossover/path/different）的料源：注册每个**被评估过**的
+        # 粒子（id→粒子），供体/谱系/异谱系意图都从这里确定性选出。generic/变异路径不读它，
+        # 只写不读，故不影响 Phase-2/3a 行为与 rng 消费。
+        self._registry: dict[str, RewardParticle] = {}
+        ac = config.action_cfg
+        self._crossover_k = getattr(ac, "crossover_k", 2) if ac is not None else 2
+        self._history_k = getattr(ac, "history_k", 4) if ac is not None else 4
 
     # ---- 工具 ----
     def _next_id(self) -> str:
@@ -111,12 +119,87 @@ class SMCIsland:
             return [(code, None, None) for code in codes]
         acts = assign_actions(len(current), ac.enabled, ac.enabled_weights())
         if hasattr(self.proposer, "propose_batch"):
-            pairs = self.proposer.propose_batch(
-                [(c.reward_code, c.eval.feedback, a) for c, a in zip(current, acts)])
+            items = [(c.reward_code, c.eval.feedback, a, self._action_context(c, a))
+                     for c, a in zip(current, acts)]
+            pairs = self.proposer.propose_batch(items)
         else:  # 兜底：老式 proposer 无 propose_batch → reflect（丢失 action 指令，仍可跑）
             pairs = [(self.proposer.reflect(c.reward_code, c.eval.feedback), None)
                      for c in current]
         return [(code, act, thought) for (code, thought), act in zip(pairs, acts)]
+
+    # ---- 历史型 action 的确定性料源（crossover/path/different；无 RNG）----
+    def _action_context(self, c: RewardParticle, action: str) -> Optional[str]:
+        """为历史型 action 从注册表确定性组装上下文块；无可用料 → None（退化为普通反思）。
+
+        变异 action（m1/m2）与 generic 恒返回 None，不读注册表，故不影响默认路径。
+        """
+        if action == "crossover":
+            donors = self._elite_donors(c.reward_code, self._crossover_k)
+            return format_crossover(donors) if donors else None
+        if action == "path_reasoning":
+            chain = self._accepted_chain(c.metadata.get("state_origin_id"))
+            return format_path(chain) if len(chain) >= 2 else None
+        if action == "different_thought":
+            chain = self._accepted_chain(c.metadata.get("state_origin_id"))
+            own_ids = {n.id for n in chain} | {c.id}
+            others = self._other_thoughts(own_ids, self._history_k)
+            return format_different(others) if others else None
+        return None
+
+    def _elite_donors(self, exclude_code: str, k: int) -> list[RewardParticle]:
+        """注册表里分数最高的 k 个 valid 供体（去重代码、排除粒子自身当前代码）。
+
+        确定性：按 (分数降序, id 升序) 排序；同代码只保留其最佳评估实例。
+        """
+        best_by_code: dict[str, RewardParticle] = {}
+        for p in self._registry.values():
+            if not (p.valid and p.search_score is not None) or p.reward_code == exclude_code:
+                continue
+            q = best_by_code.get(p.reward_code)
+            if q is None or p.search_score > q.search_score or (
+                    p.search_score == q.search_score and p.id < q.id):
+                best_by_code[p.reward_code] = p
+        uniq = sorted(best_by_code.values(),
+                      key=lambda p: (-(p.search_score or -np.inf), p.id))
+        return uniq[:k]
+
+    def _accepted_chain(self, start_id: Optional[str]) -> list[RewardParticle]:
+        """沿 accepted_transition_parent_id 回溯注册表，返回时间正序（最早→最新）的接受链。
+
+        起点为当前代码状态的 state_origin_id（真实被评估、被接受的代码）；clone 本身不入注册表，
+        故从其 state_origin_id 起步。链上每个都是真实评估状态，天然跳过 clone/reject。
+        """
+        chain: list[RewardParticle] = []
+        seen: set = set()
+        nid = start_id
+        while nid and nid in self._registry and nid not in seen:
+            seen.add(nid)
+            node = self._registry[nid]
+            chain.append(node)
+            nid = node.accepted_transition_parent_id
+        chain.reverse()
+        return chain
+
+    def _other_thoughts(self, exclude_ids: set, k: int) -> list[RewardParticle]:
+        """注册表里带 design_thought、且不在 ``exclude_ids``（本谱系）中的异谱系粒子。
+
+        去重设计意图（同一句意图只留最佳分实例），按 (分数降序, id 升序) 取前 k。
+        """
+        best_by_thought: dict[str, RewardParticle] = {}
+        for p in self._registry.values():
+            if not p.valid or not p.design_thought or p.id in exclude_ids:
+                continue
+            key = " ".join(p.design_thought.strip().split())
+            if not key:
+                continue
+            q = best_by_thought.get(key)
+            pscore = p.search_score if p.search_score is not None else -np.inf
+            qscore = (q.search_score if q and q.search_score is not None else -np.inf)
+            if q is None or pscore > qscore or (pscore == qscore and p.id < q.id):
+                best_by_thought[key] = p
+        uniq = sorted(best_by_thought.values(),
+                      key=lambda p: (-(p.search_score or -np.inf), p.id))
+        return uniq[:k]
 
     def _audit_contract(self, particle: RewardParticle, parent_code: str, action: str) -> None:
         """按 action 对 child 做 AST 契约审计（只记 metadata + 事件，不 gate）。"""
@@ -163,6 +246,7 @@ class SMCIsland:
                          clone_ancestor_id=s.get("clone_ancestor_id"),
                          proposal_action=s.get("proposal_action"))
             self._consider_best(p)
+            self._registry[p.id] = p  # 登记料源（历史型 action 用；只写不读默认路径）
             particles.append(p)
         return particles
 

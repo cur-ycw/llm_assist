@@ -119,7 +119,7 @@ def main(cfg):
                       code_output_tip=prompts["code_output_tip"], model=cfg.model,
                       temperature=cfg.temperature)
 
-    # ---- RF-Agent 五操作路由（Phase-3a：mutation_structure / mutation_parameter）----
+    # ---- RF-Agent 五操作路由（Phase-3a 变异 m1/m2；Phase-3b 历史 crossover/path/different）----
     actions_cfg = algo.get("actions", None)
     action_cfg = None
     action_prompts: dict = {}
@@ -128,12 +128,15 @@ def main(cfg):
         action_cfg = ActionConfig(
             mode="rf", enabled=enabled,
             rf_ratio=list(actions_cfg.get("rf_ratio", [2, 2, 2, 1, 1])),
-            gate_contracts=bool(actions_cfg.get("gate_contracts", False)))
+            gate_contracts=bool(actions_cfg.get("gate_contracts", False)),
+            crossover_k=int(actions_cfg.get("crossover_k", 2)),
+            history_k=int(actions_cfg.get("history_k", 4)))
         # 只加载已启用 action 的指令模板（rf_actions/<name>.txt）
         for name in enabled:
             action_prompts[name] = file_to_string(f"{pd}/rf_actions/{name}.txt")
         logging.info(f"Actions: mode=rf, enabled={enabled}, "
-                     f"weights={action_cfg.enabled_weights()}, gate={action_cfg.gate_contracts}")
+                     f"weights={action_cfg.enabled_weights()}, gate={action_cfg.gate_contracts}, "
+                     f"crossover_k={action_cfg.crossover_k}, history_k={action_cfg.history_k}")
     else:
         logging.info("Actions: mode=generic (单一 eureka_reflection)")
 

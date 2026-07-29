@@ -16,16 +16,22 @@ migration_enabled: false     # 粒子迁移仅 source_compat 开启
 
 # RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5）。
 # mode=generic（默认）：单一 eureka_reflection 通用反思，行为=Phase-2，rng 消费不变。
-# mode=rf：按 enabled 中各 action 对应 rf_ratio 权重确定性派发；Phase-3a 只实现前两个
-#   变异 action（mutation_structure / mutation_parameter），crossover/path/different 留 Phase-3b。
+# mode=rf：按 enabled 中各 action 对应 rf_ratio 权重确定性派发。Phase-3a 落地两个变异
+#   action（mutation_structure/parameter，料=粒子自身状态）；Phase-3b 补齐三个历史型
+#   action——crossover（料=注册表 top-k 高分供体代码）、path_reasoning（料=accepted-edit
+#   谱系轨迹）、different_thought（料=异谱系设计意图）。历史料由 island 确定性从注册表选出
+#   （无 RNG），无可用料时该 action 退化为普通反思。
 # rf_ratio 顺序固定对应 [mutation_structure, mutation_parameter, crossover, path_reasoning,
 #   different_thought]（RF-Agent 论文配比 [2,2,2,1,1]）。gate_contracts 恒 false：契约只审计
-#   命中率、不据此丢候选（MH 为 reward-only）。
+#   变异 action 命中率、不据此丢候选（MH 为 reward-only）。
+# crossover_k / history_k：crossover 展示的高分供体数、different_thought 展示的异谱系意图条数。
 actions:
   mode: generic
-  enabled: [mutation_structure, mutation_parameter]
+  enabled: [mutation_structure, mutation_parameter, crossover, path_reasoning, different_thought]
   rf_ratio: [2, 2, 2, 1, 1]
   gate_contracts: false
+  crossover_k: 2
+  history_k: 4
 
 # search_score 提取与归一化（计划 §5）。
 # 注意：lower/upper 是**任务相关**的归一化界，应在各 env 配置里用 score_lower/score_upper
