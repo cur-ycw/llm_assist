@@ -20,6 +20,7 @@ import openai
 from utils.extract_task_code import file_to_string
 from utils.create_task import create_task
 
+from smc.actions import ActionConfig
 from smc.evaluator import IsaacGymEvalConfig, IsaacGymEvaluator
 from smc.event_logger import EventLogger
 from smc.island import SMCIsland, SMCIslandConfig
@@ -117,7 +118,26 @@ def main(cfg):
     ctx = TaskContext(initial_system=initial_system, initial_user=initial_user,
                       code_output_tip=prompts["code_output_tip"], model=cfg.model,
                       temperature=cfg.temperature)
-    proposer = EurekaReflectionProposer(ctx, openai)
+
+    # ---- RF-Agent 五操作路由（Phase-3a：mutation_structure / mutation_parameter）----
+    actions_cfg = algo.get("actions", None)
+    action_cfg = None
+    action_prompts: dict = {}
+    if actions_cfg is not None and actions_cfg.get("mode", "generic") == "rf":
+        enabled = list(actions_cfg.get("enabled", ["mutation_structure", "mutation_parameter"]))
+        action_cfg = ActionConfig(
+            mode="rf", enabled=enabled,
+            rf_ratio=list(actions_cfg.get("rf_ratio", [2, 2, 2, 1, 1])),
+            gate_contracts=bool(actions_cfg.get("gate_contracts", False)))
+        # 只加载已启用 action 的指令模板（rf_actions/<name>.txt）
+        for name in enabled:
+            action_prompts[name] = file_to_string(f"{pd}/rf_actions/{name}.txt")
+        logging.info(f"Actions: mode=rf, enabled={enabled}, "
+                     f"weights={action_cfg.enabled_weights()}, gate={action_cfg.gate_contracts}")
+    else:
+        logging.info("Actions: mode=generic (单一 eureka_reflection)")
+
+    proposer = EurekaReflectionProposer(ctx, openai, action_prompts=action_prompts)
     max_concurrent = algo.evaluation.get("max_concurrent_evals", 6)
     evaluator = IsaacGymEvaluator(
         score_cfg, seeds=list(algo.evaluation.search_seed_panel),
@@ -129,7 +149,8 @@ def main(cfg):
             island_id=0, n_particles=algo.n_particles, beta_target=algo.beta_target,
             kappa=algo.kappa, min_iters=algo.min_smc_iterations,
             max_iters=algo.max_smc_iterations, n_proposals=algo.n_proposals,
-            max_init_retries=algo.max_init_retries, seed=algo.seed),
+            max_init_retries=algo.max_init_retries, seed=algo.seed,
+            action_cfg=action_cfg),
         proposer, evaluator,
         EventLogger(workspace_dir / "smc_events.jsonl"),
         artifact_root=workspace_dir / "candidates")

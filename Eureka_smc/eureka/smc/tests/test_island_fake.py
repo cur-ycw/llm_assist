@@ -140,3 +140,47 @@ def test_reproducible_under_same_seeds(tmp_path):
     r1, r2 = island1.run(), island2.run()
     assert r1.best.search_score == pytest.approx(r2.best.search_score)
     assert r1.n_stages == r2.n_stages
+
+
+# ---- RF-Agent Phase-3a：mutation_structure / mutation_parameter 路由 ----
+
+def _build_rf(tmp_path: Path, **overrides):
+    from eureka.smc.actions import ActionConfig
+    cfg = SMCIslandConfig(**{
+        "n_particles": 8, "beta_target": 2.0, "kappa": 0.5,
+        "min_iters": 3, "max_iters": 15, "n_proposals": 1, "seed": 0,
+        "action_cfg": ActionConfig(mode="rf",
+                                   enabled=["mutation_structure", "mutation_parameter"]),
+        **overrides,
+    })
+    score_cfg = ScoreConfig(lower=0.0, upper=1.0)
+    proposer = FakeProposer(np.random.default_rng(1))
+    evaluator = FakeEvaluator(score_cfg, seeds=(0, 1, 2), rng=np.random.default_rng(2))
+    log_path = tmp_path / "events.jsonl"
+    island = SMCIsland(cfg, proposer, evaluator, EventLogger(log_path, clock=False),
+                       artifact_root=tmp_path / "cand")
+    return island, log_path
+
+
+def test_rf_mode_routes_actions_and_audits(tmp_path):
+    island, log_path = _build_rf(tmp_path)
+    res = island.run()
+    assert res.termination_reason == "annealing_complete"
+    evs = _events(log_path)
+    # 派发的 action 落到 eval 事件
+    acts = {e.get("proposal_action") for e in evs if e["event"] == "eval"}
+    assert acts & {"mutation_structure", "mutation_parameter"}
+    # 契约审计事件存在且带布尔 contract_hit / 合法 action
+    audits = [e for e in evs if e["event"] == "contract_audit"]
+    assert len(audits) > 0
+    assert all(isinstance(e["contract_hit"], bool) for e in audits)
+    assert all(e["action"] in ("mutation_structure", "mutation_parameter") for e in audits)
+
+
+def test_generic_mode_has_no_action_metadata(tmp_path):
+    # 默认 generic 路径不应产生 action/契约元数据（保证 rf 是纯 opt-in 分支）
+    island, log_path = _build(tmp_path)
+    island.run()
+    evs = _events(log_path)
+    assert all(e.get("proposal_action") is None for e in evs if e["event"] == "eval")
+    assert not any(e["event"] == "contract_audit" for e in evs)

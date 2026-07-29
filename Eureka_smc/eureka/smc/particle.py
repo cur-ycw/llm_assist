@@ -63,6 +63,8 @@ class RewardParticle:
     proposal_parent_id: Optional[str] = None            # LLM 提议来源
     accepted_transition_parent_id: Optional[str] = None  # 真正被接受的代码状态父
     clone_ancestor_id: Optional[str] = None             # 重采样 clone 来源
+    proposal_action: Optional[str] = None               # RF-Agent action（generic 路径为 None）
+    design_thought: Optional[str] = None                # 提议时 LLM 先写的一句设计意图（免额外调用）
     artifact_dir: Optional[Path] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -83,6 +85,8 @@ class RewardParticle:
             "proposal_parent_id": self.proposal_parent_id,
             "accepted_transition_parent_id": self.accepted_transition_parent_id,
             "clone_ancestor_id": self.clone_ancestor_id,
+            "proposal_action": self.proposal_action,
+            "design_thought": self.design_thought,
             "artifact_dir": str(self.artifact_dir) if self.artifact_dir else None,
             "search_score": self.search_score,
             "valid": self.valid,

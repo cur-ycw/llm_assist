@@ -27,6 +27,8 @@ from typing import Optional
 
 import numpy as np
 
+from .actions import ActionConfig, assign_actions
+from .contracts import check_mutation_parameter, check_mutation_structure
 from .event_logger import EventLogger
 from .particle import EvalRecord, RewardParticle
 from .resampling import systematic_resample
@@ -48,6 +50,7 @@ class SMCIslandConfig:
     n_proposals: int = 1            # 每个重采样粒子的 MH 链长 K
     max_init_retries: int = 3       # 初始无效粒子的补采样上限（相对 N）
     seed: int = 0
+    action_cfg: Optional[ActionConfig] = None  # 五操作路由（None/generic=单一 eureka_reflection）
 
 
 @dataclass
@@ -93,6 +96,40 @@ class SMCIsland:
             return self.proposer.reflect_batch(items)
         return [self.proposer.reflect(code, fb) for code, fb in items]
 
+    def _propose_many(
+        self, current: list[RewardParticle]
+    ) -> list[tuple[Optional[str], Optional[str], Optional[str]]]:
+        """返回与 ``current`` 对齐的 ``(child_code, action, design_thought)``。
+
+        ``generic``（或无 action_cfg）→ 完全走旧的单一 eureka_reflection 路径，action/thought
+        为 None，**rng 消费与 Phase-2 逐字节一致**。``rf`` → 确定性 ``assign_actions`` 派 action
+        （不抽 rng）+ ``propose_batch``。proposer 无 propose_batch 时退回 reflect（不带 action 指令）。
+        """
+        ac = self.cfg.action_cfg
+        if ac is None or ac.mode == "generic":
+            codes = self._reflect_many([(c.reward_code, c.eval.feedback) for c in current])
+            return [(code, None, None) for code in codes]
+        acts = assign_actions(len(current), ac.enabled, ac.enabled_weights())
+        if hasattr(self.proposer, "propose_batch"):
+            pairs = self.proposer.propose_batch(
+                [(c.reward_code, c.eval.feedback, a) for c, a in zip(current, acts)])
+        else:  # 兜底：老式 proposer 无 propose_batch → reflect（丢失 action 指令，仍可跑）
+            pairs = [(self.proposer.reflect(c.reward_code, c.eval.feedback), None)
+                     for c in current]
+        return [(code, act, thought) for (code, thought), act in zip(pairs, acts)]
+
+    def _audit_contract(self, particle: RewardParticle, parent_code: str, action: str) -> None:
+        """按 action 对 child 做 AST 契约审计（只记 metadata + 事件，不 gate）。"""
+        if action == "mutation_structure":
+            hit = check_mutation_structure(parent_code, particle.reward_code)
+        elif action == "mutation_parameter":
+            hit = check_mutation_parameter(parent_code, particle.reward_code)
+        else:
+            return  # 其它 action（crossover/path/different）Phase-3a 无契约
+        particle.metadata["contract_action"] = action
+        particle.metadata["contract_hit"] = hit
+        self.log.log("contract_audit", id=particle.id, action=action, contract_hit=hit)
+
     def _make_particles_batch(self, specs: list[dict]) -> list[RewardParticle]:
         """给一批代码分配 id → 一次 ``evaluate_batch`` 并发评估 → 构造粒子（顺序对齐）。
 
@@ -113,12 +150,18 @@ class SMCIsland:
                 generation=s["generation"], proposal_parent_id=s.get("proposal_parent_id"),
                 accepted_transition_parent_id=s.get("accepted_transition_parent_id"),
                 clone_ancestor_id=s.get("clone_ancestor_id"), artifact_dir=d,
+                proposal_action=s.get("proposal_action"),
+                design_thought=s.get("design_thought"),
             )
             p.metadata["state_origin_id"] = s.get("state_origin_id") or pid
+            # RF-Agent 契约审计（仅对 mutation_* 且有父代码时；只记录不 gate）
+            if s.get("proposal_action") and s.get("parent_code"):
+                self._audit_contract(p, s["parent_code"], s["proposal_action"])
             self.log.log("eval", id=pid, valid=rec.valid, search_score=rec.search_score,
                          generation=s["generation"], proposal_parent_id=s.get("proposal_parent_id"),
                          accepted_transition_parent_id=s.get("accepted_transition_parent_id"),
-                         clone_ancestor_id=s.get("clone_ancestor_id"))
+                         clone_ancestor_id=s.get("clone_ancestor_id"),
+                         proposal_action=s.get("proposal_action"))
             self._consider_best(p)
             particles.append(p)
         return particles
@@ -189,17 +232,18 @@ class SMCIsland:
         # K 轮（首版 K=1）批量 MH：每轮对所有粒子当前状态**并发** reflect + evaluate，
         # 再逐粒子接受。轮内 in-place 更新 current[i]，故 K>1 时每粒子链依赖仍正确保留。
         for step in range(self.cfg.n_proposals):
-            child_codes = self._reflect_many(
-                [(c.reward_code, c.eval.feedback) for c in current])
+            proposals = self._propose_many(current)
             specs, slots = [], []
-            for i, (c, child_code) in enumerate(zip(current, child_codes)):
+            for i, (c, (child_code, action, thought)) in enumerate(zip(current, proposals)):
                 if child_code is None or child_code == c.reward_code:
-                    self.log.log("proposal_noop", id=c.id, stage=stage_idx, step=step)
+                    self.log.log("proposal_noop", id=c.id, stage=stage_idx, step=step,
+                                 action=action)
                     continue
                 specs.append(dict(
                     code=child_code, generation=c.generation, proposal_parent_id=c.id,
                     accepted_transition_parent_id=c.metadata.get("state_origin_id", c.id),
-                    clone_ancestor_id=None))
+                    clone_ancestor_id=None, proposal_action=action, design_thought=thought,
+                    parent_code=c.reward_code))
                 slots.append(i)
             children = self._make_particles_batch(specs)
             for child, i in zip(children, slots):

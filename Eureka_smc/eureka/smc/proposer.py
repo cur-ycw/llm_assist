@@ -24,7 +24,8 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["TaskContext", "extract_reward_code", "EurekaReflectionProposer", "FakeProposer"]
+__all__ = ["TaskContext", "extract_reward_code", "extract_design_thought",
+           "EurekaReflectionProposer", "FakeProposer"]
 
 
 _CODE_PATTERNS = [
@@ -62,6 +63,19 @@ def extract_reward_code(response_content: str) -> Optional[str]:
     return code_string
 
 
+def extract_design_thought(response_content: str) -> Optional[str]:
+    """取代码围栏之前的自然语言文本，作为该次提议的一句 design thought。
+
+    action 提示要求 LLM「先用一句话说明将做什么改动，再写完整代码」，因此 thought 就在
+    首个 ``` 围栏之前。免额外 LLM 调用；无围栏或围栏在开头则返回 None。
+    """
+    idx = response_content.find("```")
+    if idx <= 0:
+        return None
+    thought = response_content[:idx].strip()
+    return thought or None
+
+
 @dataclass
 class TaskContext:
     """一次 SMC 运行内冻结的任务级提示上下文。"""
@@ -77,10 +91,13 @@ class TaskContext:
 class EurekaReflectionProposer:
     """真实 LLM 提议器：初始批量生成 + 单粒子反思重生成。"""
 
-    def __init__(self, ctx: TaskContext, openai_module: Any, max_attempts: int = 30):
+    def __init__(self, ctx: TaskContext, openai_module: Any, max_attempts: int = 30,
+                 action_prompts: Optional[dict[str, str]] = None):
         self.ctx = ctx
         self._openai = openai_module  # 注入 openai 模块，便于测试替换
         self.max_attempts = max_attempts  # 单次调用的最大重试次数（避免无限重试卡死）
+        # RF-Agent action 名 → 指令尾文本；generic 模式为空 dict（不影响 reflect 路径）。
+        self.action_prompts = action_prompts or {}
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.n_calls = 0
@@ -171,6 +188,52 @@ class EurekaReflectionProposer:
                 results[futs[fut]] = fut.result()
         return results
 
+    # ---- RF-Agent action 提议（Phase-3a：mutation_structure / mutation_parameter）----
+    def _action_messages(self, parent_code: str, parent_feedback: str, action: str) -> list[dict]:
+        """四消息范式，但第 4 条 user 尾追加 action 专用指令。
+
+        指令置于 parent_feedback 之后、code_output_tip 之前——作为模型看到输出格式提醒前的
+        最后一条约束，主导本次改动方向（结构 or 仅参数）。action 未在 action_prompts 中登记
+        时指令为空串，退化为普通反思。
+        """
+        instr = self.action_prompts.get(action, "")
+        tail = parent_feedback + ("\n" + instr if instr else "") + self.ctx.code_output_tip
+        return [
+            {"role": "system", "content": self.ctx.initial_system},
+            {"role": "user", "content": self.ctx.initial_user},
+            {"role": "assistant", "content": f"```python\n{parent_code}\n```"},
+            {"role": "user", "content": tail},
+        ]
+
+    def propose_batch(
+        self, items: list[tuple[str, str, str]]
+    ) -> list[tuple[Optional[str], Optional[str]]]:
+        """并发发出 action 路由后的提议（伪并行：线程池 + 每个独立 HTTP）。
+
+        ``items`` 为 ``(parent_code, parent_feedback, action)`` 列表；返回与之对齐的
+        ``(reward_code, design_thought)`` 列表。某项失败/无法解析 → ``(None, None)``（island
+        视作 no-op 保留父代）。design_thought 从同一响应的代码围栏前文本抽取，不额外调 LLM。
+        """
+        if not items:
+            return []
+
+        def work(it: tuple[str, str, str]) -> tuple[Optional[str], Optional[str]]:
+            parent_code, parent_feedback, action = it
+            try:
+                content = self._chat(
+                    self._action_messages(parent_code, parent_feedback, action), 1)[0]
+                return extract_reward_code(content), extract_design_thought(content)
+            except Exception as e:  # noqa: BLE001 — 单个提议失败降级为 no-op，不拖垮整阶段
+                logger.warning(f"propose_batch item failed (视作 no-op): {str(e)[:160]}")
+                return None, None
+
+        results: list[tuple[Optional[str], Optional[str]]] = [(None, None)] * len(items)
+        with ThreadPoolExecutor(max_workers=len(items)) as ex:
+            futs = {ex.submit(work, it): i for i, it in enumerate(items)}
+            for fut in futs:
+                results[futs[fut]] = fut.result()
+        return results
+
 
 class FakeProposer:
     """确定性测试替身：不调用 LLM，生成携带“质量”标记的合成代码。
@@ -207,3 +270,17 @@ class FakeProposer:
             return parent_code  # no-op 提议
         q = self._quality_of(parent_code) + self.improve * self.rng.normal(1.0, 0.6)
         return self._TEMPLATE.format(q=max(0.0, q))
+
+    def propose_batch(
+        self, items: list[tuple[str, str, str]]
+    ) -> list[tuple[Optional[str], Optional[str]]]:
+        """确定性 action 提议兜底：忽略 action 语义（Fake 无领域概念），复用 reflect 的质量
+        改进逻辑，并回一个带 action 标签的合成 design_thought，供 rf 路径集成测试断言。"""
+        out: list[tuple[Optional[str], Optional[str]]] = []
+        for parent_code, parent_feedback, action in items:
+            new_code = self.reflect(parent_code, parent_feedback)
+            if new_code is None or new_code == parent_code:
+                out.append((new_code, None))  # None / no-op：无 thought
+            else:
+                out.append((new_code, f"fake design thought for {action}"))
+        return out

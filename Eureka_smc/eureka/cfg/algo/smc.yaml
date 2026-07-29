@@ -14,6 +14,19 @@ max_init_retries: 3          # 初始无效粒子补采样上限（相对 N）
 seed: 0                      # 岛屿 RNG 种子
 migration_enabled: false     # 粒子迁移仅 source_compat 开启
 
+# RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5）。
+# mode=generic（默认）：单一 eureka_reflection 通用反思，行为=Phase-2，rng 消费不变。
+# mode=rf：按 enabled 中各 action 对应 rf_ratio 权重确定性派发；Phase-3a 只实现前两个
+#   变异 action（mutation_structure / mutation_parameter），crossover/path/different 留 Phase-3b。
+# rf_ratio 顺序固定对应 [mutation_structure, mutation_parameter, crossover, path_reasoning,
+#   different_thought]（RF-Agent 论文配比 [2,2,2,1,1]）。gate_contracts 恒 false：契约只审计
+#   命中率、不据此丢候选（MH 为 reward-only）。
+actions:
+  mode: generic
+  enabled: [mutation_structure, mutation_parameter]
+  rf_ratio: [2, 2, 2, 1, 1]
+  gate_contracts: false
+
 # search_score 提取与归一化（计划 §5）。
 # 注意：lower/upper 是**任务相关**的归一化界，应在各 env 配置里用 score_lower/score_upper
 # 覆盖（如 franka_cabinet.yaml: upper=1，因其 consecutive_successes 是成功率 ∈[0,1]）。
