@@ -1,18 +1,20 @@
-"""单岛 SMC 搜索循环（迁移计划 §6.1、§6.3、§6.6、§6.8）。
+"""单岛预算条件化 KL 奖励搜索循环（新方法：预算与进展自适应 SMC 奖励搜索 §2）。
 
 流程：
-  initialize() 生成 N 个 valid 初始粒子（λ=0，不做分数选择）
-  → 循环退火阶段，直到 λ≥1（annealing_complete）或触及 max_smc_iterations：
-        1. 由当前奖励向量和 ESS 阈值求 λ_next（find_next_lambda）
-        2. 按增量权重 systematic_resample 父代 → clone 成新粒子群
-        3. 对每个 clone 做 K 次（首版 K=1）eureka_reflection 提议 + 评估 + reward-only
-           MH 接受；接受则 child 成为下一步提议源，拒绝则保留当前状态
-  → 返回与粒子群分离保存的 best_so_far 及终止原因。
+  initialize() 生成 N 个 valid 初始粒子（不做分数选择；init 的 N 次 LLM 调用单独计入 B_total=N+B）
+  → 循环修改轮，直到修改预算 b_t 耗尽（budget_exhausted）：
+        1. 由**剩余预算** b_t 解算目标有效父代数 K*_t、KL 半径 δ_t、选择强度 λ_t 与父代分布
+           q_t = softmax(λ_t·J)（kl_controller.resolve；J 为**原始**任务性能，不归一化）
+        2. 抽 M_t = min(N, b_t) 个父代副本 A^j ~ Categorical(q_t)（multinomial_resample）→ clone
+        3. 每个副本一次 LLM 修改（RF 五操作路由）+ 评估 + **sigmoid 非对称接受**：改进确定进入，
+           非改进以 σ(λ_t·Δ) 概率进入；拒绝则保留父代代码
+        4. b_t -= M_t（每次 LLM 修改调用都计预算，含无效候选，§7.2）
+  → 返回与粒子群分离保存的 best_so_far（按原始 J）及终止原因。
 
-接受规则 α = min(1, exp(β_t·ΔR))（β_t = λ_next·β_target）忠实于 SMCEvolve 论文的
-reward-only 近似，不恢复未知的 LLM 提议概率比（计划 §6.6，属 SMC-inspired 优化启发式）。
+选择集中度**只由剩余预算决定**（不看 ESS / 近期成功率 / EMA，§2.3）：预算充足→K*≈N（广探、
+首轮 λ=0 均匀），预算耗尽→K*→K_min（集中）。这取代了旧的 ESS 自适应退火桥（temperature.py 已删）。
 
-provenance（计划 §4.1 不变量）：
+provenance（不变量）：
   * clone 只写 ``clone_ancestor_id``，继承父的 accepted_transition，不伪造代码优化；
   * 被接受的 child 的 ``accepted_transition_parent_id`` 指向被替换代码的真实来源
     （``state_origin_id``），因此沿它回溯得到纯 accepted-edit 链，自动跳过 clone/reject。
@@ -21,19 +23,20 @@ provenance（计划 §4.1 不变量）：
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
+from . import kl_controller
 from .actions import ActionConfig, assign_actions
 from .contracts import check_mutation_parameter, check_mutation_structure
 from .context import format_crossover, format_different, format_path
 from .event_logger import EventLogger
 from .particle import EvalRecord, RewardParticle
-from .resampling import systematic_resample
-from .temperature import ess_from_log_weights, find_next_lambda, log_incremental_weights
+from .resampling import multinomial_resample
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +46,10 @@ __all__ = ["SMCIslandConfig", "SMCIsland", "IslandResult"]
 @dataclass
 class SMCIslandConfig:
     island_id: int = 0
-    n_particles: int = 8
-    beta_target: float = 2.0        # Batch-1 仿真推荐（小 N 下避免谱系坍缩）
-    kappa: float = 0.5
-    min_iters: int = 3              # max_delta = 1/min_iters
-    max_iters: int = 15             # max_smc_iterations
-    n_proposals: int = 1            # 每个重采样粒子的 MH 链长 K
+    n_particles: int = 8            # 粒子数 N
+    budget: int = 64               # 修改预算 B（初始种群后允许的 LLM 修改次数）
+    k_min: int = 2                 # 有效父代数下界 K_min（预算耗尽时的集中度）
+    gamma: float = 1.0             # K*_t = K_min + (N-K_min)(b_t/B)^gamma 的曲率
     max_init_retries: int = 3       # 初始无效粒子的补采样上限（相对 N）
     seed: int = 0
     action_cfg: Optional[ActionConfig] = None  # 五操作路由（None/generic=单一 eureka_reflection）
@@ -57,10 +58,10 @@ class SMCIslandConfig:
 @dataclass
 class IslandResult:
     best: Optional[RewardParticle]
-    termination_reason: str         # annealing_complete | budget_exhausted | insufficient_valid_particles
-    n_stages: int
-    final_lambda: float
-    min_ess: float
+    termination_reason: str         # budget_exhausted | insufficient_valid_particles
+    n_rounds: int
+    budget_used: int                # 已消耗的 LLM 修改调用数（应等于 B）
+    last_lambda: float              # 最后一轮的选择强度 λ_t（诊断）
 
 
 class SMCIsland:
@@ -280,24 +281,49 @@ class SMCIsland:
         self.log.log("init_done", n_valid=len(particles), attempts=attempts)
         return particles[:n]
 
-    # ---- 一个退火阶段（计划 §6.3、§6.6）----
-    def _stage(self, particles: list[RewardParticle], lam_prev: float,
-               stage_idx: int) -> tuple[list[RewardParticle], float, float]:
-        rewards = np.array([p.search_score for p in particles], dtype=np.float64)
-        lam_next = find_next_lambda(rewards, lam_prev, self.cfg.beta_target,
-                                    self.cfg.kappa, 1.0 / self.cfg.min_iters)
-        delta = lam_next - lam_prev
-        beta_t = lam_next * self.cfg.beta_target
+    # ---- 一个修改轮（新方法 §2.3–2.6）----
+    @staticmethod
+    def _gini(counts) -> float:
+        """修改次数分配的 Gini 系数（§8.4；0=均匀，→1=集中到单父代）。"""
+        x = np.sort(np.asarray(counts, dtype=np.float64))
+        n = x.size
+        s = x.sum()
+        if n == 0 or s <= 0.0:
+            return 0.0
+        cum = np.cumsum(x)
+        return float((n + 1 - 2.0 * cum.sum() / cum[-1]) / n)
 
-        logw = log_incremental_weights(rewards, delta, self.cfg.beta_target)
-        ess = ess_from_log_weights(logw)
-        w = np.exp(logw - logw.max())
-        idx = systematic_resample(w, self.rng)
-        self.log.log("stage_start", stage=stage_idx, lam_prev=lam_prev, lam_next=lam_next,
-                     beta_t=beta_t, ess=ess, ancestors=idx.tolist(),
-                     rewards=rewards.tolist())
+    def _round(self, particles: list[RewardParticle], b_t: int,
+               round_idx: int) -> tuple[list[RewardParticle], "kl_controller.ControllerStep", int]:
+        n = len(particles)
+        # 原始 J（population 均为 valid；None 兜底为当轮有限最小值，控制器要求有限输入）
+        raw = [p.search_score for p in particles]
+        finite = [x for x in raw if x is not None]
+        floor = min(finite) if finite else 0.0
+        J = np.array([x if x is not None else floor for x in raw], dtype=np.float64)
 
-        # clone 重采样父代 → 新粒子群（clone 不重新评估，复制父的 eval）
+        step = kl_controller.resolve(J, float(b_t), float(self.cfg.budget), n,
+                                     float(self.cfg.k_min), float(self.cfg.gamma))
+        m_t = min(n, int(b_t))
+        idx = multinomial_resample(step.q, m_t, self.rng)
+
+        counts = np.bincount(idx, minlength=n)
+        self.log.log(
+            "stage_start", stage=round_idx, budget_remaining=int(b_t),
+            budget_frac=float(b_t) / float(self.cfg.budget), m_t=m_t,
+            k_star=step.k_star, k_feas=step.k_feas, m_ties=step.m_ties,
+            kl_requested=step.delta_req, kl_feasible=step.delta_feas,
+            kl_actual=step.kl_actual, lam=step.lam, k_eff=step.k_eff,
+            max_parent_prob=step.max_q, kl_saturated=step.saturated,
+            unique_parents=int(np.count_nonzero(counts)),
+            resample_counts=counts.tolist(), alloc_gini=self._gini(counts),
+            pop_score_min=float(J.min()), pop_score_median=float(np.median(J)),
+            pop_score_max=float(J.max()), pop_score_range=float(J.max() - J.min()),
+            archive_best=self.best.search_score if self.best else None,
+            ancestors=idx.tolist(),
+        )
+
+        # clone 重采样父代 → 本轮活动集（clone 不重新评估，复制父的 eval）
         current: list[RewardParticle] = []
         for a in idx:
             parent = particles[int(a)]
@@ -313,62 +339,67 @@ class SMCIsland:
             self.log.log("resample_clone", id=clone.id, ancestor=parent.id)
             current.append(clone)
 
-        # K 轮（首版 K=1）批量 MH：每轮对所有粒子当前状态**并发** reflect + evaluate，
-        # 再逐粒子接受。轮内 in-place 更新 current[i]，故 K>1 时每粒子链依赖仍正确保留。
-        for step in range(self.cfg.n_proposals):
-            proposals = self._propose_many(current)
-            specs, slots = [], []
-            for i, (c, (child_code, action, thought)) in enumerate(zip(current, proposals)):
-                if child_code is None or child_code == c.reward_code:
-                    self.log.log("proposal_noop", id=c.id, stage=stage_idx, step=step,
-                                 action=action)
-                    continue
-                specs.append(dict(
-                    code=child_code, generation=c.generation, proposal_parent_id=c.id,
-                    accepted_transition_parent_id=c.metadata.get("state_origin_id", c.id),
-                    clone_ancestor_id=None, proposal_action=action, design_thought=thought,
-                    parent_code=c.reward_code))
-                slots.append(i)
-            children = self._make_particles_batch(specs)
-            for child, i in zip(children, slots):
-                current[i] = self._mh_accept(current[i], child, beta_t, stage_idx, step)
-        return current, lam_next, ess
+        # 每个副本一次 LLM 修改（RF 五操作路由）→ 并发评估 → 逐粒子 sigmoid 接受。
+        proposals = self._propose_many(current)
+        specs, slots = [], []
+        for i, (c, (child_code, action, thought)) in enumerate(zip(current, proposals)):
+            if child_code is None or child_code == c.reward_code:
+                self.log.log("proposal_noop", id=c.id, stage=round_idx, action=action)
+                continue
+            specs.append(dict(
+                code=child_code, generation=c.generation, proposal_parent_id=c.id,
+                accepted_transition_parent_id=c.metadata.get("state_origin_id", c.id),
+                clone_ancestor_id=None, proposal_action=action, design_thought=thought,
+                parent_code=c.reward_code))
+            slots.append(i)
+        children = self._make_particles_batch(specs)
+        for child, i in zip(children, slots):
+            current[i] = self._sigmoid_accept(current[i], child, step.lam, round_idx)
+        return current, step, m_t
 
-    def _mh_accept(self, current: RewardParticle, child: RewardParticle,
-                   beta_t: float, stage_idx: int, step: int) -> RewardParticle:
-        """reward-only MH 接受（计划 §6.6）：ΔR≥0 必接受；否则以 exp(β_t·ΔR) 概率接受。"""
+    def _sigmoid_accept(self, current: RewardParticle, child: RewardParticle,
+                        lam_t: float, round_idx: int) -> RewardParticle:
+        """非对称 sigmoid 接受（新方法 §2.6）：Δ>0 确定进入；Δ≤0 以 σ(λ_t·Δ) 概率进入。"""
         if not child.valid or child.search_score is None:
-            self.log.log("accept_decision", parent=current.id, child=child.id, stage=stage_idx,
-                         step=step, accepted=False, reason="invalid_child")
+            self.log.log("accept_decision", parent=current.id, child=child.id, stage=round_idx,
+                         accepted=False, reason="invalid_child")
             return current
-        delta_r = child.search_score - (current.search_score or 0.0)
-        if delta_r >= 0.0:
+        delta = child.search_score - (current.search_score or 0.0)
+        improved = delta > 0.0
+        if improved:
             accept = True
+            p_accept = 1.0
         else:
-            accept = self.rng.random() < float(np.exp(beta_t * delta_r))
-        self.log.log("accept_decision", parent=current.id, child=child.id, stage=stage_idx,
-                     step=step, delta_r=delta_r, beta_t=beta_t, accepted=accept)
+            p_accept = float(1.0 / (1.0 + np.exp(-lam_t * delta)))  # σ(λ_t·Δ), Δ≤0 → ≤0.5
+            accept = self.rng.random() < p_accept
+        self.log.log("accept_decision", parent=current.id, child=child.id, stage=round_idx,
+                     delta=delta, lam=lam_t, p_accept=p_accept, improved=improved,
+                     accepted=accept)
         return child if accept else current
 
-    # ---- 主循环（计划 §6.8）----
+    # ---- 主循环（新方法 §2.5：预算耗尽即停）----
     def run(self) -> IslandResult:
         particles = self.initialize()
         if len(particles) < 1:
-            return IslandResult(self.best, "insufficient_valid_particles", 0, 0.0, 0.0)
+            return IslandResult(self.best, "insufficient_valid_particles", 0, 0, 0.0)
 
-        lam = 0.0
-        stage = 0
-        min_ess = float(len(particles))
-        while lam < 1.0 - 1e-9 and stage < self.cfg.max_iters:
-            particles, lam, ess = self._stage(particles, lam, stage)
-            min_ess = min(min_ess, ess)
-            stage += 1
-            self.log.log("stage_end", stage=stage, lam=lam,
+        b_t = int(self.cfg.budget)
+        n = self.cfg.n_particles
+        round_idx = 0
+        last_lambda = 0.0
+        max_rounds = math.ceil(self.cfg.budget / max(1, n)) + 1  # 安全上界
+        while b_t > 0 and round_idx < max_rounds:
+            particles, step, m_t = self._round(particles, b_t, round_idx)
+            b_t -= m_t                      # 每次 LLM 修改调用计预算（含无效候选，§7.2）
+            last_lambda = step.lam
+            round_idx += 1
+            self.log.log("stage_end", stage=round_idx, budget_remaining=b_t,
                          best_score=self.best.search_score if self.best else None,
                          unique_lineages=len({p.metadata.get("state_origin_id") for p in particles}))
 
-        reason = "annealing_complete" if lam >= 1.0 - 1e-9 else "budget_exhausted"
-        self.log.log("island_done", termination_reason=reason, n_stages=stage,
-                     final_lambda=lam, best_id=self.best.id if self.best else None,
+        budget_used = int(self.cfg.budget) - max(0, b_t)
+        self.log.log("island_done", termination_reason="budget_exhausted", n_rounds=round_idx,
+                     budget_used=budget_used, last_lambda=last_lambda,
+                     best_id=self.best.id if self.best else None,
                      best_score=self.best.search_score if self.best else None)
-        return IslandResult(self.best, reason, stage, lam, min_ess)
+        return IslandResult(self.best, "budget_exhausted", round_idx, budget_used, last_lambda)

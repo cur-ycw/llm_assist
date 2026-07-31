@@ -23,11 +23,11 @@ from typing import Any, Optional
 class EvalRecord:
     """一次奖励代码评估的统一封装（计划 §4.2）。
 
-    ``search_score`` 是用于 SMC 权重与 MH 接受率的**唯一**标量；对无效候选为
-    ``None``。其余字段供反馈构造、日志和复现使用。
+    ``search_score`` 是用于 KL 父代选择权重与 sigmoid 接受率的**唯一**标量 = **原始** J
+    （新方法 §2.2，不归一化）；对无效候选为 ``None``。其余字段供反馈构造、日志和复现使用。
     """
 
-    search_score: Optional[float]           # 归一化后的搜索分；无效 -> None
+    search_score: Optional[float]           # 原始任务性能 J；无效 -> None
     valid: bool                             # 可解析 + 可导入 + 可执行
     executable: bool                        # 训练子进程无 traceback
     feedback: str = ""                      # 喂给下一次 proposal 的反馈文本

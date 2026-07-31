@@ -1,29 +1,25 @@
-# SMC 搜索控制器配置（迁移计划 §7）。默认值来自 Batch-1 可行性仿真：
-# 小 N 下 beta_target>=5 会导致谱系坍缩，故 Cartpole-scale 采用 N=8, beta=2, kappa=0.5。
-# 详见 smc/FINDINGS_batch1.md。
+# 预算条件化 KL–Feynman–Kac 奖励搜索控制器配置（新方法：预算与进展自适应 SMC §2）。
+# 父代选择集中度**只由剩余修改预算决定**：K*_t = k_min + (N-k_min)(b_t/budget)^gamma，
+# 映射为 KL 半径 δ_t=log(N/K*)，一维二分反解选择强度 λ_t 使 KL(softmax(λJ)‖U_N)=δ_t。
+# 预算充足→K*≈N（首轮 λ=0 均匀广探），预算耗尽→K*→k_min（集中）。取代旧 ESS 退火桥。
 
 authority_mode: paper_core   # paper_core | source_compat
 n_islands: 1                 # 首版单岛
-n_particles: 16              # 每岛粒子数 N（16：init 池更大、且 β=2 落在 ln16≈2.77 坍缩余量内）
-beta_target: 2.0             # 终端逆温 beta_target（Batch-1 推荐，避免坍缩）
-kappa: 0.5                   # ESS 阈值系数（标准 SMC ~0.5，而非计划初稿的 0.9）
-min_smc_iterations: 3        # max_delta_lambda = 1/min_smc_iterations
-max_smc_iterations: 15       # 退火阶段上限
-n_proposals: 1               # 每个重采样粒子的 MH 链长 K
-max_init_retries: 3          # 初始无效粒子补采样上限（相对 N）
+n_particles: 16              # 每岛粒子数 N
+budget: 64                   # 修改预算 B：初始种群建立后允许的 LLM 修改次数（B_total = N + B）
+k_min: 2                     # 有效父代数下界 K_min（预算耗尽时的集中度）
+gamma: 1.0                   # K* 日程曲率（(b/B)^gamma；>1 更晚集中、<1 更早集中）
 seed: 0                      # 岛屿 RNG 种子
+max_init_retries: 3          # 初始无效粒子补采样上限（相对 N）
 migration_enabled: false     # 粒子迁移仅 source_compat 开启
 
-# RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5）。
-# mode=generic（默认）：单一 eureka_reflection 通用反思，行为=Phase-2，rng 消费不变。
-# mode=rf：按 enabled 中各 action 对应 rf_ratio 权重确定性派发。Phase-3a 落地两个变异
-#   action（mutation_structure/parameter，料=粒子自身状态）；Phase-3b 补齐三个历史型
-#   action——crossover（料=注册表 top-k 高分供体代码）、path_reasoning（料=accepted-edit
-#   谱系轨迹）、different_thought（料=异谱系设计意图）。历史料由 island 确定性从注册表选出
-#   （无 RNG），无可用料时该 action 退化为普通反思。
+# RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5），与父代分配层正交。
+# mode=generic（默认）：单一 eureka_reflection 通用反思。
+# mode=rf：按 enabled 中各 action 对应 rf_ratio 权重确定性派发。历史料由 island 确定性从注册表
+#   选出（无 RNG），无可用料时该 action 退化为普通反思。
 # rf_ratio 顺序固定对应 [mutation_structure, mutation_parameter, crossover, path_reasoning,
 #   different_thought]（RF-Agent 论文配比 [2,2,2,1,1]）。gate_contracts 恒 false：契约只审计
-#   变异 action 命中率、不据此丢候选（MH 为 reward-only）。
+#   变异 action 命中率、不据此丢候选（接受核为 reward-only sigmoid）。
 # crossover_k / history_k：crossover 展示的高分供体数、different_thought 展示的异谱系意图条数。
 actions:
   mode: generic
@@ -33,22 +29,20 @@ actions:
   crossover_k: 2
   history_k: 4
 
-# search_score 提取与归一化（计划 §5）。
-# 注意：lower/upper 是**任务相关**的归一化界，应在各 env 配置里用 score_lower/score_upper
-# 覆盖（如 franka_cabinet.yaml: upper=1，因其 consecutive_successes 是成功率 ∈[0,1]）。
-# 这里的值仅作缺省 fallback。
+# search_score 提取（新方法 §0/§2.2：直接用原始 J，**不归一化**）。
+# lower/upper 已退出热路径（仅配置兼容保留）；控制器/接受/best 全用原始聚合标量。
 score:
   metric: consecutive_successes
   fallback_metric: gt_reward
   aggregate: final_window_mean   # 非 max：避免乐观高方差选择偏差（审查 #4）
   window_frac: 0.1
-  lower: 0.0
-  upper: 1.0                      # fallback：成功率类任务的天花板；回报类任务须在 env 覆盖
+  lower: 0.0                      # 已退出热路径
+  upper: 1.0                      # 已退出热路径
 
 # 评估（计划 §5.2）。
 # 搜索阶段单 seed(42) 评估每个奖励——与 Eureka 协议一致、预算公平；该 seed 上的表现即
-# 定义为奖励的 search_score，不额外多 seed 降噪(太烧预算)。所有候选共享同一 seed=CRN，
-# 使分数差值更多反映奖励本身而非 seed 运气。仅最后对最优/top-k 用 heldout 多 seed 复评。
+# 定义为奖励的 search_score（原始 J）。所有候选共享同一 seed=CRN，使分数差值更多反映奖励
+# 本身而非 seed 运气。仅最后对最优/top-k 用 heldout 多 seed 复评。
 evaluation:
   search_seed_panel: [42]                          # 单 seed 搜索(固定 CRN)，与 Eureka 一致
   heldout_seed_panel: [100, 101, 102, 103, 104]    # 最后复评，与搜索 seed 完全不重叠

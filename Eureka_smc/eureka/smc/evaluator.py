@@ -275,11 +275,10 @@ class IsaacGymEvaluator(Evaluator):
             error="signature_parse_error", wall_time_s=time.time() - t0)
 
     def _aggregate(self, seed_results: dict, artifact_dir: Path, t0: float) -> EvalRecord:
-        """把一个候选各 seed 的运行结果聚合成 EvalRecord（原 _evaluate_uncached 尾部逻辑）。"""
+        """把一个候选各 seed 的运行结果聚合成 EvalRecord（原始 J，新方法 §2.2，不归一化）。"""
         env_copy = str(artifact_dir / "env_code.py")
-        per_seed_norm: list[float] = []
+        per_seed_raw: list[float] = []
         gpt_rewards: list[float] = []
-        raw_first: Optional[float] = None
         feedback = ""
         stdout_paths: list[str] = []
         last_tb = ""
@@ -289,18 +288,16 @@ class IsaacGymEvaluator(Evaluator):
             if logs is None:
                 last_tb = tb
                 continue
-            sc = compute_search_score(logs, self.score_cfg)
-            if sc is None:
+            raw = compute_search_score(logs, self.score_cfg)
+            if raw is None:
                 continue
-            raw, norm = sc
-            per_seed_norm.append(norm)
+            per_seed_raw.append(raw)
             if "gpt_reward" in logs and len(logs["gpt_reward"]):
                 gpt_rewards.append(float(np.mean(logs["gpt_reward"])))
             if not feedback:  # 用首个成功 seed 构造反馈
                 feedback = self._build_feedback(logs)
-                raw_first = raw
 
-        if not per_seed_norm:
+        if not per_seed_raw:
             return EvalRecord(
                 search_score=None, valid=False, executable=False,
                 feedback=self.prompts["execution_error_feedback"].format(traceback_msg=last_tb)
@@ -308,12 +305,12 @@ class IsaacGymEvaluator(Evaluator):
                 error=last_tb or "no_valid_metric", env_code_path=env_copy,
                 stdout_paths=tuple(stdout_paths), wall_time_s=time.time() - t0)
 
-        score = float(np.mean(per_seed_norm))  # panel 聚合：归一化分均值（计划 §5.2）
+        score = float(np.mean(per_seed_raw))  # panel 聚合：原始 J 的 seed 均值（新方法 §2.2）
         return EvalRecord(
             search_score=score, valid=True, executable=True, feedback=feedback,
-            raw_metrics={"raw_first_seed": raw_first, "search_score": score,
+            raw_metrics={"search_score": score,
                          "gpt_reward_mean": float(np.mean(gpt_rewards)) if gpt_rewards else None},
-            reward_components={"per_seed_normalized": per_seed_norm},
+            reward_components={"per_seed": per_seed_raw},
             env_code_path=env_copy, stdout_paths=tuple(stdout_paths),
             wall_time_s=time.time() - t0)
 

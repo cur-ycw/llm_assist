@@ -1,11 +1,13 @@
 """SMC search controller for Eureka reward-function evolution.
 
-Batch 1 shipped the pure numeric core (ESS temperature schedule + systematic
-resampling) and a feasibility simulation. Batch 2 adds the data model, score
-normalisation, proposer, evaluator (real + fake), event log and the single-island
-live loop (``eureka_reflection`` proposal, reward-only MH acceptance).
+The parent-resource-allocation layer is the **budget-conditioned KL–Feynman–Kac
+controller** (``kl_controller``): selection concentration is driven purely by the
+remaining LLM-modification budget (target effective parents K* → KL radius → solved
+selection strength λ → Boltzmann–Gibbs parent distribution over **raw** J), parents
+are resampled multinomially into LLM modification calls, and children enter via an
+asymmetric sigmoid transition kernel. Runs until the modification budget is spent.
 
-See ``Eureka_SMCEvolve_框架迁移实施计划.md``.
+See ``预算与进展自适应_SMC奖励搜索_实验计划.md``.
 """
 
 from __future__ import annotations
@@ -21,6 +23,16 @@ from .context import format_crossover, format_different, format_path
 from .event_logger import EventLogger
 from .evaluator import Evaluator, FakeEvaluator, IsaacGymEvalConfig, IsaacGymEvaluator
 from .island import IslandResult, SMCIsland, SMCIslandConfig
+from .kl_controller import (
+    ControllerStep,
+    boltzmann_gibbs,
+    effective_parents,
+    feasible_target,
+    kl_to_uniform,
+    resolve,
+    solve_lambda,
+    target_effective_parents,
+)
 from .particle import EvalRecord, RewardParticle
 from .proposer import (
     EurekaReflectionProposer,
@@ -29,21 +41,20 @@ from .proposer import (
     extract_design_thought,
     extract_reward_code,
 )
-from .resampling import systematic_resample
+from .resampling import multinomial_resample, systematic_resample
 from .score import ScoreConfig, clipped_linear, compute_search_score
-from .temperature import (
-    ess,
-    ess_from_log_weights,
-    find_next_lambda,
-    log_incremental_weights,
-)
 
 __all__ = [
-    # numeric core
-    "ess",
-    "ess_from_log_weights",
-    "find_next_lambda",
-    "log_incremental_weights",
+    # budget-conditioned KL controller
+    "ControllerStep",
+    "target_effective_parents",
+    "boltzmann_gibbs",
+    "kl_to_uniform",
+    "effective_parents",
+    "feasible_target",
+    "solve_lambda",
+    "resolve",
+    "multinomial_resample",
     "systematic_resample",
     # score
     "ScoreConfig",

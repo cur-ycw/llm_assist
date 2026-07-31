@@ -149,18 +149,16 @@ def main(cfg):
 
     island = SMCIsland(
         SMCIslandConfig(
-            island_id=0, n_particles=algo.n_particles, beta_target=algo.beta_target,
-            kappa=algo.kappa, min_iters=algo.min_smc_iterations,
-            max_iters=algo.max_smc_iterations, n_proposals=algo.n_proposals,
-            max_init_retries=algo.max_init_retries, seed=algo.seed,
-            action_cfg=action_cfg),
+            island_id=0, n_particles=algo.n_particles, budget=algo.budget,
+            k_min=algo.k_min, gamma=algo.gamma, max_init_retries=algo.max_init_retries,
+            seed=algo.seed, action_cfg=action_cfg),
         proposer, evaluator,
         EventLogger(workspace_dir / "smc_events.jsonl"),
         artifact_root=workspace_dir / "candidates")
 
     result = island.run()
-    logging.info(f"SMC done: reason={result.termination_reason}, stages={result.n_stages}, "
-                 f"lambda={result.final_lambda:.3f}, "
+    logging.info(f"SMC done: reason={result.termination_reason}, rounds={result.n_rounds}, "
+                 f"budget_used={result.budget_used}, last_lambda={result.last_lambda:.4f}, "
                  f"best_score={result.best.search_score if result.best else None}")
     logging.info(f"LLM calls={proposer.n_calls}, prompt_tok={proposer.total_prompt_tokens}, "
                  f"completion_tok={proposer.total_completion_tokens}, RL evals={evaluator.n_evals}")
@@ -181,12 +179,12 @@ def main(cfg):
                                      max_concurrent=max_concurrent)
     rec = heldout_eval.evaluate(result.best.reward_code, "heldout",
                                 workspace_dir / "heldout")
-    per_seed = rec.reward_components.get("per_seed_normalized", [])
-    logging.info(f"Held-out normalized search_score: mean={rec.search_score}, "
+    per_seed = rec.reward_components.get("per_seed", [])
+    logging.info(f"Held-out raw search_score (J): mean={rec.search_score}, "
                  f"per_seed={per_seed}")
     np.savez(workspace_dir / "smc_summary.npz",
-             termination_reason=result.termination_reason, n_stages=result.n_stages,
-             final_lambda=result.final_lambda,
+             termination_reason=result.termination_reason, n_rounds=result.n_rounds,
+             budget_used=result.budget_used, last_lambda=result.last_lambda,
              best_search_score=result.best.search_score,
              heldout_search_score=rec.search_score if rec.search_score is not None else np.nan,
              heldout_per_seed=np.array(per_seed, dtype=float),

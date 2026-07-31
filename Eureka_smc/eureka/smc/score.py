@@ -1,15 +1,14 @@
-"""搜索分数的提取与固定尺度归一化（迁移计划 §5）。
+"""搜索分数的提取（新方法 §0/§2.2：直接使用原始任务性能 J，**不做归一化**）。
 
-这是从通用 SMCEvolve 迁移到 Eureka 最关键的适配层：把每任务尺度各异的原始 RL 指标
-（如 ``consecutive_successes``）映射到一个跨阶段一致、可比较的 ``[0,1]`` 能量 ``R(x)``，
-使 ``exp(beta * ΔR)`` 的含义稳定。
+新方法冻结「奖励标准化」为延期项：父代选择、sigmoid 接受、best/archive 排序、held-out 复评
+一律使用环境求解器返回的**原始** J（``compute_search_score`` 返回原始聚合标量）。KL 父代分布
+``q=softmax(λ·J)`` 关于正仿射变换不变，尺度由 λ 吸收，故无需跨任务定标（详见 kl_controller）。
 
 设计要点：
-  * **固定尺度**：用任务级冻结的 ``lower/upper`` 做 clipped-linear，不做每代 min-max
-    重归一化（否则同一代码的目标能量会随种群变化，破坏跨阶段一致性，计划 §5.1）。
-  * **聚合量可配**：默认 ``final_window_mean``（曲线末段均值），而非原 Eureka 的
-    ``max``——max-over-curve 是乐观、高方差的选择统计量，会放大 RL 噪声（审查 #4）。
-  * 指标缺失时返回 ``None``（无效候选不进入温度二分，计划 §4.2）。
+  * **原始 J**：``compute_search_score`` 对主指标（或回退指标）时间序列做窗口聚合后**直接返回**，
+    不再套 clipped-linear。``clipped_linear`` 函数保留（未来 reporting/消融可能用），但不喂控制器。
+  * 聚合量可配：默认 ``final_window_mean``（曲线末段均值），避免 max-over-curve 的乐观高方差。
+  * 指标缺失时返回 ``None``（无效候选不进入控制器）。
 
 纯 numpy，无 Isaac Gym 依赖，可单测。
 """
@@ -26,14 +25,18 @@ __all__ = ["ScoreConfig", "aggregate_metric", "clipped_linear", "compute_search_
 
 @dataclass(frozen=True)
 class ScoreConfig:
-    """search_score 的提取与归一化配置（每任务在 pilot 后冻结 lower/upper）。"""
+    """search_score 的提取配置。
+
+    ``lower/upper`` 在新方法中**已退出热路径**（不再归一化），仅为配置向后兼容保留；如未来
+    重启归一化研究再启用（须建新方法版本，§0）。
+    """
 
     metric: str = "consecutive_successes"   # 主指标；缺失时回退到 fallback_metric
     fallback_metric: str = "gt_reward"      # 无 success 概念的任务（如 Cartpole 早期）
     aggregate: str = "final_window_mean"    # final_window_mean | mean | max
     window_frac: float = 0.1                # final_window_mean 取末段比例
-    lower: float = 0.0
-    upper: float = 500.0                    # Cartpole 占位：max_episode_length；pilot 后冻结
+    lower: float = 0.0                      # 已退出热路径（保留兼容）
+    upper: float = 500.0                    # 已退出热路径（保留兼容）
 
 
 def aggregate_metric(values: Sequence[float], how: str, window_frac: float = 0.1) -> float:
@@ -52,7 +55,7 @@ def aggregate_metric(values: Sequence[float], how: str, window_frac: float = 0.1
 
 
 def clipped_linear(raw: float, lower: float, upper: float) -> float:
-    """固定尺度 clipped-linear 归一化到 ``[0,1]``（计划 §5.1）。"""
+    """固定尺度 clipped-linear 归一化到 ``[0,1]``（保留供未来 reporting/消融；不在控制器热路径）。"""
     if upper <= lower:
         raise ValueError("upper must exceed lower")
     return float(np.clip((raw - lower) / (upper - lower), 0.0, 1.0))
@@ -60,15 +63,14 @@ def clipped_linear(raw: float, lower: float, upper: float) -> float:
 
 def compute_search_score(
     tensorboard_logs: Mapping[str, Sequence[float]], cfg: ScoreConfig
-) -> Optional[tuple[float, float]]:
-    """返回 ``(raw, normalized)``；主指标与回退指标都缺失时返回 ``None``。
+) -> Optional[float]:
+    """返回**原始** J（聚合标量）；主指标与回退指标都缺失时返回 ``None``。
 
-    ``normalized`` 是喂给 SMC 权重/接受的唯一标量 ``R(x)``。
+    这是喂给 KL 控制器权重 / sigmoid 接受 / best 排序的唯一标量（新方法 §2.2，不归一化）。
     """
     metric = cfg.metric
     if metric not in tensorboard_logs or len(tensorboard_logs[metric]) == 0:
         metric = cfg.fallback_metric
     if metric not in tensorboard_logs or len(tensorboard_logs[metric]) == 0:
         return None
-    raw = aggregate_metric(tensorboard_logs[metric], cfg.aggregate, cfg.window_frac)
-    return raw, clipped_linear(raw, cfg.lower, cfg.upper)
+    return aggregate_metric(tensorboard_logs[metric], cfg.aggregate, cfg.window_frac)
