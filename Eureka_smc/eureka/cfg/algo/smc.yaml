@@ -1,13 +1,14 @@
 # 预算条件化 KL–Feynman–Kac 奖励搜索控制器配置（新方法：预算与进展自适应 SMC §2）。
 # 父代选择集中度**只由剩余修改预算决定**：K*_t = k_min + (N-k_min)(b_t/budget)^gamma，
 # 映射为 KL 半径 δ_t=log(N/K*)，一维二分反解选择强度 λ_t 使 KL(softmax(λJ)‖U_N)=δ_t。
-# 预算充足→K*≈N（首轮 λ=0 均匀广探），预算耗尽→K*→k_min（集中）。取代旧 ESS 退火桥。
+# budget=B_total 含 init 的 N 个初始生成 → init 一建立即扣 N，首个修改轮 b_t/budget=(B_total-N)/B_total<1
+# → 集中度从一开始就非均匀（init 不是边界特例）；预算耗尽→K*→k_min（最集中）。取代旧 ESS 退火桥。
 
 authority_mode: paper_core   # paper_core | source_compat
 n_islands: 1                 # 首版单岛
 n_particles: 16              # 初始父代种群规模 N（init 生成并修复到 16 个有效种子）
 children_per_round: 8        # 每轮子代数 M（对齐 RF-Agent rf_ratio [2,2,2,1,1]=8；Option A：init 后种群稳定为 8）
-budget: 64                   # 修改预算 B：初始种群建立后允许的 LLM 修改次数（B_total = N + B）
+budget: 80                   # 总预算 B_total（含 init 的 N=16 个初始生成；修改次数 = B_total − N = 64）
 k_min: 2                     # 有效父代数下界 K_min（预算耗尽时的集中度）
 gamma: 1.0                   # K* 日程曲率（(b/B)^gamma；>1 更晚集中、<1 更早集中）
 seed: 0                      # 岛屿 RNG 种子

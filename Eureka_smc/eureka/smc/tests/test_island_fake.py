@@ -78,8 +78,9 @@ def test_run_reaches_budget_exhausted(tmp_path):
     island, _ = _build(tmp_path)
     res = island.run()
     assert res.termination_reason == "budget_exhausted"
-    assert res.budget_used == 16                 # B 全部消耗
-    assert res.n_rounds == 4                      # 16 / children_per_round(4) = 4 轮
+    assert res.budget_used == 16                 # B_total 全部消耗（init 8 + 修改 8）
+    # 修改预算 = B_total − N = 16 − 8 = 8；8 / children_per_round(4) = 2 轮
+    assert res.n_rounds == 2
     assert res.best is not None and res.best.search_score is not None
 
 
@@ -94,23 +95,26 @@ def test_population_shrinks_to_children_per_round(tmp_path):
 
 
 def test_partial_final_round_spends_remaining_budget(tmp_path):
-    # B 非 M 整数倍：末轮 m_t = min(M, b_t) 只花剩余预算（阶段A-15）。
-    island, log_path = _build(tmp_path, budget=18)   # 4+4+4+4+2
+    # B_total 非 M 整数倍：修改预算 = 18 − 8 = 10 → 末轮 m_t = min(M, b_t) 只花剩余（阶段A-15）。
+    island, log_path = _build(tmp_path, budget=18)   # init8 → 修改 4+4+2 = 10
     res = island.run()
     assert res.budget_used == 18
-    assert res.n_rounds == 5
+    assert res.n_rounds == 3
     starts = [e for e in _events(log_path) if e["event"] == "stage_start"]
-    assert [e["m_t"] for e in starts] == [4, 4, 4, 4, 2]
+    assert [e["m_t"] for e in starts] == [4, 4, 2]
 
 
-def test_first_round_is_uniform_selection(tmp_path):
-    # 预算满 b_0=B → K*=N → δ=0 → λ=0 → q=U_N（首轮广探，n=初始种群 8）。
-    island, log_path = _build(tmp_path)
+def test_first_round_reflects_init_budget_consumption(tmp_path):
+    # 预算记账：B_total 含 init 的 N → init 一建立即扣 N，首个修改轮 b_t = B_total − N。
+    # 故首轮 budget_frac = (16−8)/16 = 0.5 < 1 → K* < N、λ > 0（非均匀，init 不是边界特例）。
+    island, log_path = _build(tmp_path)   # n_particles=8, budget=16, children_per_round=4
     island.run()
     first = next(e for e in _events(log_path) if e["event"] == "stage_start")
-    assert first["lam"] == pytest.approx(0.0, abs=1e-6)
-    assert first["max_parent_prob"] == pytest.approx(1.0 / 8, abs=1e-6)
-    assert first["k_star"] == pytest.approx(8.0, abs=0.1)
+    assert first["budget_remaining"] == 8                       # B_total − N = 16 − 8
+    assert first["budget_frac"] == pytest.approx(0.5, abs=1e-9)
+    assert first["k_star"] == pytest.approx(5.0, abs=0.1)       # 2 + (8−2)·0.5
+    assert first["lam"] > 0.0                                   # 非 λ=0 均匀
+    assert first["max_parent_prob"] > 1.0 / 8                   # 已有集中度
 
 
 def test_concentration_increases_as_budget_drains(tmp_path):

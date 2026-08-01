@@ -1,18 +1,22 @@
 """单岛预算条件化 KL 奖励搜索循环（新方法：预算与进展自适应 SMC 奖励搜索 §2）。
 
 流程：
-  initialize() 生成 N 个 valid 初始粒子（不做分数选择；init 的 N 次 LLM 调用单独计入 B_total=N+B）
-  → 循环修改轮，直到修改预算 b_t 耗尽（budget_exhausted）：
+  initialize() 生成 N 个 valid 初始粒子（不做分数选择）。**预算记账**：总预算 budget=B_total
+  即含这 N 个初始生成（B_total = N + 修改次数）；init 一建立就"花掉" N 个预算，故首个修改轮
+  的剩余预算已是 b_t = B_total − N（而非 B_total），集中度从一开始就非均匀——这 N 次初始生成
+  已经消耗了预算、也已经承载了初始奖励的强度（用户明示：init 不是边界特例，它就在 B_total 里）。
+  → 循环修改轮，直到剩余预算 b_t 耗尽（budget_exhausted）：
         1. 由**剩余预算** b_t 解算目标有效父代数 K*_t、KL 半径 δ_t、选择强度 λ_t 与父代分布
            q_t = softmax(λ_t·J)（kl_controller.resolve；J 为**原始**任务性能，不归一化）
-        2. 抽 M_t = min(N, b_t) 个父代副本 A^j ~ Categorical(q_t)（multinomial_resample）→ clone
+        2. 抽 M_t = min(children_per_round, b_t) 个父代副本 A^j ~ Categorical(q_t)（multinomial）→ clone
         3. 每个副本一次 LLM 修改（RF 五操作路由）+ 评估 + **sigmoid 非对称接受**：改进确定进入，
            非改进以 σ(λ_t·Δ) 概率进入；拒绝则保留父代代码
         4. b_t -= M_t（每次 LLM 修改调用都计预算，含无效候选，§7.2）
   → 返回与粒子群分离保存的 best_so_far（按原始 J）及终止原因。
 
-选择集中度**只由剩余预算决定**（不看 ESS / 近期成功率 / EMA，§2.3）：预算充足→K*≈N（广探、
-首轮 λ=0 均匀），预算耗尽→K*→K_min（集中）。这取代了旧的 ESS 自适应退火桥（temperature.py 已删）。
+选择集中度**只由剩余预算决定**（不看 ESS / 近期成功率 / EMA，§2.3）：分母恒为 B_total，故首个
+修改轮 b_t/B_total = (B_total−N)/B_total < 1 → 已有集中度（不是 λ=0 均匀）；预算耗尽→K*→K_min
+（最集中）。这取代了旧的 ESS 自适应退火桥（temperature.py 已删）。
 
 provenance（不变量）：
   * clone 只写 ``clone_ancestor_id``，继承父的 accepted_transition，不伪造代码优化；
@@ -46,11 +50,11 @@ __all__ = ["SMCIslandConfig", "SMCIsland", "IslandResult"]
 @dataclass
 class SMCIslandConfig:
     island_id: int = 0
-    n_particles: int = 16           # 初始父代种群规模（init 生成并修复到这么多有效种子）
+    n_particles: int = 16           # 初始父代种群规模 N（init 生成并修复到这么多有效种子）
     children_per_round: int = 8     # 每轮子代数 M（=重采样-变异次数；Option A：init 后种群稳定为此值）
-    budget: int = 64               # 修改预算 B（初始种群后允许的 LLM 修改次数）
+    budget: int = 80               # 总预算 B_total（含 init 的 N；集中度分母；修改次数 = B_total − N）
     k_min: int = 2                 # 有效父代数下界 K_min（预算耗尽时的集中度）
-    gamma: float = 1.0             # K*_t = K_min + (N-K_min)(b_t/B)^gamma 的曲率
+    gamma: float = 1.0             # K*_t = K_min + (N-K_min)(b_t/B_total)^gamma 的曲率
     max_init_repair: int = 8        # 初始种子 traceback-repair 的最大波数（RF-Agent 式，≈其 max_try_num=9）
     max_same_repair: int = 3        # 同一种子连续修复失败多少次后丢弃、改抽全新（RF-Agent max_same_try_cnt）
     seed: int = 0
@@ -62,7 +66,7 @@ class IslandResult:
     best: Optional[RewardParticle]
     termination_reason: str         # budget_exhausted | insufficient_valid_particles
     n_rounds: int
-    budget_used: int                # 已消耗的 LLM 修改调用数（应等于 B）
+    budget_used: int                # 已消耗的总预算（init N + LLM 修改调用），应等于 B_total
     last_lambda: float              # 最后一轮的选择强度 λ_t（诊断）
 
 
@@ -409,11 +413,17 @@ class SMCIsland:
         if len(particles) < 1:
             return IslandResult(self.best, "insufficient_valid_particles", 0, 0, 0.0)
 
-        b_t = int(self.cfg.budget)
+        # 预算记账：总预算 B_total 含 init 的 N 个初始生成 → init 一建立就扣掉 N，
+        # 故首个修改轮的剩余预算已是 B_total − N（首轮集中度非均匀，用户明示 init 在预算内）。
+        b_total = int(self.cfg.budget)
+        b_t = b_total - int(self.cfg.n_particles)
+        self.log.log("init_budget_spent", n_init=int(self.cfg.n_particles),
+                     budget_total=b_total, budget_remaining=b_t)
         round_idx = 0
         last_lambda = 0.0
-        # 每轮花 min(children_per_round, b_t)（≥1）→ 至多 ceil(B/M) 轮；+1 兜底
-        max_rounds = math.ceil(self.cfg.budget / max(1, self.cfg.children_per_round)) + 1
+        # 修改预算 = B_total − N，每轮花 min(children_per_round, b_t) → 至多 ceil((B_total−N)/M) 轮；+1 兜底
+        mutation_budget = max(0, b_total - int(self.cfg.n_particles))
+        max_rounds = math.ceil(mutation_budget / max(1, self.cfg.children_per_round)) + 1
         while b_t > 0 and round_idx < max_rounds:
             particles, step, m_t = self._round(particles, b_t, round_idx)
             b_t -= m_t                      # 每次 LLM 修改调用计预算（含无效候选，§7.2）
@@ -423,7 +433,7 @@ class SMCIsland:
                          best_score=self.best.search_score if self.best else None,
                          unique_lineages=len({p.metadata.get("state_origin_id") for p in particles}))
 
-        budget_used = int(self.cfg.budget) - max(0, b_t)
+        budget_used = b_total - max(0, b_t)   # init N + 已花修改次数（应 = B_total）
         self.log.log("island_done", termination_reason="budget_exhausted", n_rounds=round_idx,
                      budget_used=budget_used, last_lambda=last_lambda,
                      best_id=self.best.id if self.best else None,
