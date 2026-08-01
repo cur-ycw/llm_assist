@@ -92,12 +92,16 @@ class EurekaReflectionProposer:
     """真实 LLM 提议器：初始批量生成 + 单粒子反思重生成。"""
 
     def __init__(self, ctx: TaskContext, openai_module: Any, max_attempts: int = 30,
-                 action_prompts: Optional[dict[str, str]] = None):
+                 action_prompts: Optional[dict[str, str]] = None,
+                 initial_failed_prompt: Optional[str] = None):
         self.ctx = ctx
         self._openai = openai_module  # 注入 openai 模块，便于测试替换
         self.max_attempts = max_attempts  # 单次调用的最大重试次数（避免无限重试卡死）
         # RF-Agent action 名 → 指令尾文本；generic 模式为空 dict（不影响 reflect 路径）。
         self.action_prompts = action_prompts or {}
+        # 初始种子 traceback-repair 的 feedback 模板（RF-Agent initial_failed_feedback）；
+        # 含 {reward_function} 与 {traceback_msg} 两个占位。None → repair 退化为普通重生成。
+        self.initial_failed_prompt = initial_failed_prompt
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.n_calls = 0
@@ -144,6 +148,48 @@ class EurekaReflectionProposer:
             {"role": "user", "content": self.ctx.initial_user},
         ]
         return [extract_reward_code(c) for c in self._chat(messages, n)]
+
+    def _repair_messages(self, failed_code: str, traceback_msg: str) -> list[dict]:
+        """RF-Agent 式初始修复消息：把失败代码 + 具体报错喂回，令 LLM 自 debug（2 消息）。
+
+        对齐官方 RF-Agent（system=initial_system，user=initial_user + initial_failed_feedback）。
+        无 initial_failed_prompt 时退化为普通重生成（等价 initial_batch 的单条）。
+        """
+        if not self.initial_failed_prompt:
+            return [
+                {"role": "system", "content": self.ctx.initial_system},
+                {"role": "user", "content": self.ctx.initial_user},
+            ]
+        fb = self.initial_failed_prompt.format(
+            reward_function=failed_code, traceback_msg=traceback_msg)
+        return [
+            {"role": "system", "content": self.ctx.initial_system},
+            {"role": "user", "content": self.ctx.initial_user + fb + self.ctx.code_output_tip},
+        ]
+
+    def repair_batch(self, items: list[tuple[str, str]]) -> list[Optional[str]]:
+        """并发修复一批失败的初始种子（RF-Agent 初始 traceback-repair 的批量适配）。
+
+        ``items`` 为 ``(failed_code, traceback_msg)`` 列表；每项把报错喂回让 LLM 修正，返回
+        对齐的新代码（失败/无法解析 → ``None``）。island 的初始化循环据此逐波修复直到 N 个有效。
+        """
+        if not items:
+            return []
+
+        def work(it: tuple[str, str]) -> Optional[str]:
+            try:
+                return extract_reward_code(self._chat(
+                    self._repair_messages(it[0], it[1]), 1)[0])
+            except Exception as e:  # noqa: BLE001 — 单个修复失败降级，下一波再试或换新
+                logger.warning(f"repair_batch item failed: {str(e)[:160]}")
+                return None
+
+        results: list[Optional[str]] = [None] * len(items)
+        with ThreadPoolExecutor(max_workers=len(items)) as ex:
+            futs = {ex.submit(work, it): i for i, it in enumerate(items)}
+            for fut in futs:
+                results[futs[fut]] = fut.result()
+        return results
 
     def reflect(self, parent_code: str, parent_feedback: str) -> Optional[str]:
         """基于父粒子当前代码 + 训练反馈生成 1 个新代码（计划 §6.4）。
@@ -253,12 +299,15 @@ class FakeProposer:
     """
 
     _TEMPLATE = "def compute_reward(self):  # quality={q:.6f}\n    return self.rew_buf, {{}}\n"
+    _INVALID = "this is not a valid reward function (no def, no quality marker)\n"
 
     def __init__(self, rng, base: float = 0.2, spread: float = 0.5,
-                 improve: float = 0.08, noop_rate: float = 0.1):
+                 improve: float = 0.08, noop_rate: float = 0.1,
+                 init_invalid_frac: float = 0.0):
         self.rng = rng
         self.base, self.spread = base, spread
         self.improve, self.noop_rate = improve, noop_rate
+        self.init_invalid_frac = init_invalid_frac  # 初始批量里判为无效的比例（测试 init 修复用）
         self.n_calls = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -271,6 +320,14 @@ class FakeProposer:
     def initial_batch(self, n: int) -> list[Optional[str]]:
         self.n_calls += n
         qs = self.base + self.spread * self.rng.random(n)
+        flags = self.rng.random(n) < self.init_invalid_frac
+        return [self._INVALID if bad else self._TEMPLATE.format(q=q)
+                for q, bad in zip(qs, flags)]
+
+    def repair_batch(self, items: list[tuple[str, str]]) -> list[Optional[str]]:
+        """确定性修复兜底：把无效初始码"修"成有效码（模拟 RF-Agent traceback-repair 收敛）。"""
+        self.n_calls += len(items)
+        qs = self.base + self.spread * self.rng.random(len(items))
         return [self._TEMPLATE.format(q=q) for q in qs]
 
     def reflect(self, parent_code: str, parent_feedback: str) -> Optional[str]:

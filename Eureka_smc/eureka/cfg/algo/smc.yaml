@@ -5,12 +5,14 @@
 
 authority_mode: paper_core   # paper_core | source_compat
 n_islands: 1                 # 首版单岛
-n_particles: 16              # 每岛粒子数 N
+n_particles: 16              # 初始父代种群规模 N（init 生成并修复到 16 个有效种子）
+children_per_round: 8        # 每轮子代数 M（对齐 RF-Agent rf_ratio [2,2,2,1,1]=8；Option A：init 后种群稳定为 8）
 budget: 64                   # 修改预算 B：初始种群建立后允许的 LLM 修改次数（B_total = N + B）
 k_min: 2                     # 有效父代数下界 K_min（预算耗尽时的集中度）
 gamma: 1.0                   # K* 日程曲率（(b/B)^gamma；>1 更晚集中、<1 更早集中）
 seed: 0                      # 岛屿 RNG 种子
-max_init_retries: 3          # 初始无效粒子补采样上限（相对 N）
+max_init_repair: 8           # 初始种子 traceback-repair 最大波数（RF-Agent 式：报错喂回让 LLM 自修复）
+max_same_repair: 3           # 同一种子连修失败多少次后改抽全新（RF-Agent max_same_try_cnt）
 migration_enabled: false     # 粒子迁移仅 source_compat 开启
 
 # RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5），与父代分配层正交。

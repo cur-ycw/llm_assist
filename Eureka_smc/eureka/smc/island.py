@@ -46,11 +46,13 @@ __all__ = ["SMCIslandConfig", "SMCIsland", "IslandResult"]
 @dataclass
 class SMCIslandConfig:
     island_id: int = 0
-    n_particles: int = 8            # 粒子数 N
+    n_particles: int = 16           # 初始父代种群规模（init 生成并修复到这么多有效种子）
+    children_per_round: int = 8     # 每轮子代数 M（=重采样-变异次数；Option A：init 后种群稳定为此值）
     budget: int = 64               # 修改预算 B（初始种群后允许的 LLM 修改次数）
     k_min: int = 2                 # 有效父代数下界 K_min（预算耗尽时的集中度）
     gamma: float = 1.0             # K*_t = K_min + (N-K_min)(b_t/B)^gamma 的曲率
-    max_init_retries: int = 3       # 初始无效粒子的补采样上限（相对 N）
+    max_init_repair: int = 8        # 初始种子 traceback-repair 的最大波数（RF-Agent 式，≈其 max_try_num=9）
+    max_same_repair: int = 3        # 同一种子连续修复失败多少次后丢弃、改抽全新（RF-Agent max_same_try_cnt）
     seed: int = 0
     action_cfg: Optional[ActionConfig] = None  # 五操作路由（None/generic=单一 eureka_reflection）
 
@@ -251,35 +253,59 @@ class SMCIsland:
             particles.append(p)
         return particles
 
-    # ---- 初始化（计划 §6.1）----
+    # ---- 初始化（计划 §6.1 + RF-Agent 初始 traceback-repair）----
     def initialize(self) -> list[RewardParticle]:
+        """生成并**修复**到 N 个有效初始种子（RF-Agent 式：报错喂回让 LLM 自 debug）。
+
+        逐波进行：生成一波候选 → 并发评估 → 有效的收下；无效的把其 traceback 喂回 proposer
+        的 ``repair_batch`` 修复（同一种子连续失败 ``max_same_repair`` 次则丢弃、改抽全新），
+        直到集满 N 个有效或达到 ``max_init_repair`` 波数上限。冷启动可执行率低的任务（如 Ant）
+        靠这个自修复把种群顶到 N，而不是像旧版那样冷抽到上限就返回残缺种群。
+        """
         n = self.cfg.n_particles
-        particles: list[RewardParticle] = []
-        budget = n + self.cfg.max_init_retries * n
-        codes = list(self.proposer.initial_batch(n))  # 单次 n= 调用，服务端并行
-        attempts = 0
-        while len(particles) < n and attempts < budget:
-            need = n - len(particles)
-            if not codes:
-                codes = list(self.proposer.initial_batch(need))
-            batch_codes: list[str] = []
-            while codes and len(batch_codes) < need and attempts < budget:
-                code = codes.pop()
-                attempts += 1
-                if code is None:
-                    continue
-                batch_codes.append(code)
-            if not batch_codes:
-                continue
-            new_particles = self._make_particles_batch(
-                [dict(code=c, generation=0) for c in batch_codes])  # 一波并发评估
-            for p in new_particles:
+        can_repair = (hasattr(self.proposer, "repair_batch") and self.cfg.max_init_repair > 0)
+        valid: list[RewardParticle] = []
+        wave = [dict(code=c, tries=0) for c in self.proposer.initial_batch(n) if c]
+        waves = 0
+        max_waves = self.cfg.max_init_repair + 1
+        while len(valid) < n and waves < max_waves:
+            need = n - len(valid)
+            if len(wave) < need:  # None/不足 → 用全新初始码补足本波
+                extra = [c for c in self.proposer.initial_batch(need - len(wave)) if c]
+                wave.extend(dict(code=c, tries=0) for c in extra)
+            wave = wave[:need]
+            if not wave:
+                break
+            particles = self._make_particles_batch(
+                [dict(code=w["code"], generation=0) for w in wave])
+            waves += 1
+            repairs: list[tuple[str, str, int]] = []  # (failed_code, traceback, next_tries)
+            fresh_need = 0
+            for w, p in zip(wave, particles):
                 if p.valid:
-                    particles.append(p)
+                    valid.append(p)
+                    if len(valid) >= n:
+                        break
                 else:
-                    self.log.log("init_invalid", id=p.id)
-        self.log.log("init_done", n_valid=len(particles), attempts=attempts)
-        return particles[:n]
+                    self.log.log("init_invalid", id=p.id, tries=w["tries"])
+                    if not can_repair or w["tries"] + 1 >= self.cfg.max_same_repair:
+                        fresh_need += 1                          # 连修失败 / 不支持修复 → 换全新
+                    else:
+                        repairs.append((p.reward_code, p.eval.error or "execution error",
+                                        w["tries"] + 1))
+            if len(valid) >= n:
+                break
+            next_wave: list[dict] = []
+            if repairs:  # 带 traceback 的自修复
+                fixed = self.proposer.repair_batch([(c, tb) for c, tb, _ in repairs])
+                next_wave.extend(dict(code=rc, tries=tries)
+                                 for (_, _, tries), rc in zip(repairs, fixed) if rc)
+            if fresh_need:  # 换全新初始码
+                fresh = [c for c in self.proposer.initial_batch(fresh_need) if c]
+                next_wave.extend(dict(code=c, tries=0) for c in fresh)
+            wave = next_wave
+        self.log.log("init_done", n_valid=len(valid), waves=waves)
+        return valid[:n]
 
     # ---- 一个修改轮（新方法 §2.3–2.6）----
     @staticmethod
@@ -304,7 +330,7 @@ class SMCIsland:
 
         step = kl_controller.resolve(J, float(b_t), float(self.cfg.budget), n,
                                      float(self.cfg.k_min), float(self.cfg.gamma))
-        m_t = min(n, int(b_t))
+        m_t = min(self.cfg.children_per_round, int(b_t))   # 每轮子代数 M（Option A：种群随之稳定为 M）
         idx = multinomial_resample(step.q, m_t, self.rng)
 
         counts = np.bincount(idx, minlength=n)
@@ -384,10 +410,10 @@ class SMCIsland:
             return IslandResult(self.best, "insufficient_valid_particles", 0, 0, 0.0)
 
         b_t = int(self.cfg.budget)
-        n = self.cfg.n_particles
         round_idx = 0
         last_lambda = 0.0
-        max_rounds = math.ceil(self.cfg.budget / max(1, n)) + 1  # 安全上界
+        # 每轮花 min(children_per_round, b_t)（≥1）→ 至多 ceil(B/M) 轮；+1 兜底
+        max_rounds = math.ceil(self.cfg.budget / max(1, self.cfg.children_per_round)) + 1
         while b_t > 0 and round_idx < max_rounds:
             particles, step, m_t = self._round(particles, b_t, round_idx)
             b_t -= m_t                      # 每次 LLM 修改调用计预算（含无效候选，§7.2）

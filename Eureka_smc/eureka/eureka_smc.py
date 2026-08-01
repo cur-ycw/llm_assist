@@ -83,7 +83,8 @@ def main(cfg):
     pd = f"{EUREKA_ROOT_DIR}/utils/prompts"
     prompts = {k: file_to_string(f"{pd}/{k}.txt") for k in
                ("initial_system", "code_output_tip", "code_feedback", "initial_user",
-                "reward_signature", "policy_feedback", "execution_error_feedback")}
+                "reward_signature", "policy_feedback", "execution_error_feedback",
+                "initial_failed_feedback")}
     initial_system = prompts["initial_system"].format(
         task_reward_signature_string=prompts["reward_signature"]) + prompts["code_output_tip"]
     initial_user = prompts["initial_user"].format(
@@ -140,7 +141,8 @@ def main(cfg):
     else:
         logging.info("Actions: mode=generic (单一 eureka_reflection)")
 
-    proposer = EurekaReflectionProposer(ctx, openai, action_prompts=action_prompts)
+    proposer = EurekaReflectionProposer(ctx, openai, action_prompts=action_prompts,
+                                        initial_failed_prompt=prompts["initial_failed_feedback"])
     max_concurrent = algo.evaluation.get("max_concurrent_evals", 6)
     evaluator = IsaacGymEvaluator(
         score_cfg, seeds=list(algo.evaluation.search_seed_panel),
@@ -149,8 +151,10 @@ def main(cfg):
 
     island = SMCIsland(
         SMCIslandConfig(
-            island_id=0, n_particles=algo.n_particles, budget=algo.budget,
-            k_min=algo.k_min, gamma=algo.gamma, max_init_retries=algo.max_init_retries,
+            island_id=0, n_particles=algo.n_particles,
+            children_per_round=algo.children_per_round, budget=algo.budget,
+            k_min=algo.k_min, gamma=algo.gamma,
+            max_init_repair=algo.max_init_repair, max_same_repair=algo.max_same_repair,
             seed=algo.seed, action_cfg=action_cfg),
         proposer, evaluator,
         EventLogger(workspace_dir / "smc_events.jsonl"),

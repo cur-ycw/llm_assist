@@ -1,0 +1,9 @@
+The reward function you just wrote produced an execution error and could not run:
+
+Your generated reward function is:
+```python
+{reward_function}
+```
+Execution error: {traceback_msg}
+
+Please fix the bug and provide a corrected reward function that compiles and runs correctly. Only use input variables that are actually attributes of the provided environment class (variables with the ``self.`` prefix shown in the environment code); do not reference intermediate variables that are local to the observation function.

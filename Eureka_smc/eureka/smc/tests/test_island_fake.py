@@ -1,8 +1,11 @@
 """单岛预算条件化 KL 循环的集成测试：用 Fake 提议器 + Fake 评估器，不烧 GPU。
 
-验证控制器骨架本身（初始化 / 预算条件化 KL 父代选择 / multinomial 重采样 / sigmoid 非对称
-接受 / genealogy / 预算耗尽停止 / RF 五操作路由）在便宜替身上的正确性，与真实 Isaac Gym /
-LLM 解耦。父代选择/接受用**原始 J**（新方法 §2.2），不归一化。
+验证控制器骨架本身（初始化 + RF-Agent 式 traceback-repair / 预算条件化 KL 父代选择 /
+multinomial 重采样 / sigmoid 非对称接受 / genealogy / 预算耗尽停止 / RF 五操作路由）在便宜
+替身上的正确性。父代选择/接受用**原始 J**（新方法 §2.2）。
+
+数量约定（Option A）：初始 N 个父代 → 每轮 children_per_round 个子代；init 后种群稳定为
+children_per_round。
 """
 
 from __future__ import annotations
@@ -21,17 +24,21 @@ from eureka.smc.proposer import FakeProposer
 from eureka.smc.score import ScoreConfig
 
 
-def _build(tmp_path: Path, **overrides):
+def _island(proposer, tmp_path: Path, **overrides):
     cfg = SMCIslandConfig(**{
-        "n_particles": 8, "budget": 16, "k_min": 2, "gamma": 1.0, "seed": 0, **overrides,
+        "n_particles": 8, "children_per_round": 4, "budget": 16,
+        "k_min": 2, "gamma": 1.0, "seed": 0, **overrides,
     })
     score_cfg = ScoreConfig(lower=0.0, upper=1.0)  # fake quality 已在 [0,~0.8]（原始 J）
-    proposer = FakeProposer(np.random.default_rng(1))
     evaluator = FakeEvaluator(score_cfg, seeds=(0, 1, 2), rng=np.random.default_rng(2))
     log_path = tmp_path / "events.jsonl"
     island = SMCIsland(cfg, proposer, evaluator, EventLogger(log_path, clock=False),
                        artifact_root=tmp_path / "cand")
     return island, log_path
+
+
+def _build(tmp_path: Path, **overrides):
+    return _island(FakeProposer(np.random.default_rng(1)), tmp_path, **overrides)
 
 
 def _events(log_path: Path):
@@ -46,27 +53,58 @@ def test_initialize_yields_n_valid_particles(tmp_path):
     assert len({p.id for p in ps}) == 8  # 唯一 ID
 
 
+def test_init_repair_fills_to_n_valid(tmp_path):
+    # 初始 60% 无效，repair_batch 修成有效 → RF-Agent 式修复应集满 N（不再冷抽到上限就残缺）。
+    proposer = FakeProposer(np.random.default_rng(1), init_invalid_frac=0.6)
+    island, log_path = _island(proposer, tmp_path)
+    ps = island.initialize()
+    assert len(ps) == 8                       # 修复到满 N
+    assert all(p.valid for p in ps)
+    evs = _events(log_path)
+    assert any(e["event"] == "init_invalid" for e in evs)   # 确实发生过无效
+    done = next(e for e in evs if e["event"] == "init_done")
+    assert done["n_valid"] == 8 and done["waves"] >= 2      # 多波修复
+
+
+def test_init_repair_disabled_falls_back(tmp_path):
+    # max_init_repair=0 时不修复，只靠"换全新"补足；仍应尽力集满 N（FakeProposer 全新总有效）。
+    proposer = FakeProposer(np.random.default_rng(1), init_invalid_frac=0.5)
+    island, _ = _island(proposer, tmp_path, max_init_repair=0)
+    ps = island.initialize()
+    assert all(p.valid for p in ps)
+
+
 def test_run_reaches_budget_exhausted(tmp_path):
     island, _ = _build(tmp_path)
     res = island.run()
     assert res.termination_reason == "budget_exhausted"
     assert res.budget_used == 16                 # B 全部消耗
-    assert res.n_rounds == 2                      # ceil(16 / 8) = 2 轮
+    assert res.n_rounds == 4                      # 16 / children_per_round(4) = 4 轮
     assert res.best is not None and res.best.search_score is not None
 
 
-def test_partial_final_round_spends_remaining_budget(tmp_path):
-    # B 非 N 整数倍：末轮 M_t = min(N, b_t) 只花剩余预算（新方法 §2.5 / 阶段A-15）。
-    island, log_path = _build(tmp_path, budget=20)   # 8 + 8 + 4
-    res = island.run()
-    assert res.budget_used == 20
-    assert res.n_rounds == 3
+def test_population_shrinks_to_children_per_round(tmp_path):
+    # Option A：init 后种群稳定为 children_per_round。resample_counts 长度 = 当轮种群规模。
+    island, log_path = _build(tmp_path)
+    island.run()
     starts = [e for e in _events(log_path) if e["event"] == "stage_start"]
-    assert [e["m_t"] for e in starts] == [8, 8, 4]
+    assert len(starts[0]["resample_counts"]) == 8   # 第 0 轮父代种群 = 初始 N
+    assert len(starts[1]["resample_counts"]) == 4   # 之后稳定为 children_per_round
+    assert all(len(s["resample_counts"]) == 4 for s in starts[1:])
+
+
+def test_partial_final_round_spends_remaining_budget(tmp_path):
+    # B 非 M 整数倍：末轮 m_t = min(M, b_t) 只花剩余预算（阶段A-15）。
+    island, log_path = _build(tmp_path, budget=18)   # 4+4+4+4+2
+    res = island.run()
+    assert res.budget_used == 18
+    assert res.n_rounds == 5
+    starts = [e for e in _events(log_path) if e["event"] == "stage_start"]
+    assert [e["m_t"] for e in starts] == [4, 4, 4, 4, 2]
 
 
 def test_first_round_is_uniform_selection(tmp_path):
-    # 预算满 b_0=B → K*=N → δ=0 → λ=0 → q=U_N（首轮广探，新方法 §2.3）。
+    # 预算满 b_0=B → K*=N → δ=0 → λ=0 → q=U_N（首轮广探，n=初始种群 8）。
     island, log_path = _build(tmp_path)
     island.run()
     first = next(e for e in _events(log_path) if e["event"] == "stage_start")
@@ -76,7 +114,6 @@ def test_first_round_is_uniform_selection(tmp_path):
 
 
 def test_concentration_increases_as_budget_drains(tmp_path):
-    # 随预算耗尽 K* 单调不增、max 父代概率不减（除非全同分回退）。
     island, log_path = _build(tmp_path, budget=32)
     island.run()
     starts = [e for e in _events(log_path) if e["event"] == "stage_start"]
@@ -85,7 +122,6 @@ def test_concentration_increases_as_budget_drains(tmp_path):
 
 
 def test_best_is_separated_from_population(tmp_path):
-    # 历史最优不应被重采样/拒绝丢失：best.score >= 任何评估过的粒子分数。
     island, log_path = _build(tmp_path)
     res = island.run()
     scores = [e["search_score"] for e in _events(log_path)
@@ -94,7 +130,6 @@ def test_best_is_separated_from_population(tmp_path):
 
 
 def test_archive_best_monotonic_nondecreasing(tmp_path):
-    # 检查表 §6-12：archive 历史最佳单调不下降。
     island, log_path = _build(tmp_path, budget=32)
     island.run()
     ends = [e for e in _events(log_path) if e["event"] == "stage_end"]
@@ -110,7 +145,6 @@ def _particle(pid: str, score: float) -> RewardParticle:
 
 
 def test_sigmoid_accept_improvement_always_enters(tmp_path):
-    # Δ>0 → 确定进入（p=1），与 λ 无关。
     island, _ = _build(tmp_path)
     parent, child = _particle("p", 0.3), _particle("c", 0.9)
     for lam in (0.0, 1.0, 100.0):
@@ -118,7 +152,6 @@ def test_sigmoid_accept_improvement_always_enters(tmp_path):
 
 
 def test_sigmoid_accept_lambda_zero_is_half(tmp_path):
-    # 检查表 §6-10：λ=0 时非改进接受概率 = σ(0) = 0.5。
     island, log_path = _build(tmp_path)
     parent, child = _particle("p", 0.9), _particle("c", 0.3)  # Δ<0
     island._sigmoid_accept(parent, child, 0.0, 0)
@@ -127,7 +160,6 @@ def test_sigmoid_accept_lambda_zero_is_half(tmp_path):
 
 
 def test_sigmoid_accept_large_lambda_rejects_worse(tmp_path):
-    # 大 λ + 明显负 Δ → σ(λΔ)≈0 → 必拒（确定性：p_accept 极小，任何 rng 抽样都拒）。
     island, log_path = _build(tmp_path)
     parent, child = _particle("p", 0.9), _particle("c", 0.1)  # Δ=-0.8
     kept = island._sigmoid_accept(parent, child, 100.0, 0)
@@ -145,7 +177,6 @@ def test_invalid_child_rejected(tmp_path):
 
 
 def test_all_positive_delta_accepts_over_full_run(tmp_path):
-    # 强不变量：run 全程 Δ>0（improved）的接受决策必为 True。
     island, log_path = _build(tmp_path)
     island.run()
     for e in _events(log_path):
@@ -171,7 +202,7 @@ def test_genealogy_accepted_chain_skips_clones(tmp_path):
 def test_registry_populated(tmp_path):
     island, _ = _build(tmp_path)
     island.run()
-    assert len(island._registry) >= 8  # 至少初始化的粒子被登记
+    assert len(island._registry) >= 8
 
 
 def test_noop_and_stage_events_logged(tmp_path):
@@ -182,8 +213,6 @@ def test_noop_and_stage_events_logged(tmp_path):
 
 
 def test_reproducible_under_same_seeds(tmp_path):
-    # 三条独立 seeded RNG（island seed=0 / FakeProposer(1) / FakeEvaluator(2)）；multinomial
-    # 重采样与派发均确定性 → 同 seed 复现。
     island1, _ = _build(tmp_path / "a")
     island2, _ = _build(tmp_path / "b")
     r1, r2 = island1.run(), island2.run()
@@ -196,19 +225,12 @@ def test_reproducible_under_same_seeds(tmp_path):
 
 def _build_rf(tmp_path: Path, **overrides):
     from eureka.smc.actions import ActionConfig
-    cfg = SMCIslandConfig(**{
-        "n_particles": 8, "budget": 16, "k_min": 2, "gamma": 1.0, "seed": 0,
+    return _island(FakeProposer(np.random.default_rng(1)), tmp_path, **{
+        "n_particles": 8, "children_per_round": 8, "budget": 16,
         "action_cfg": ActionConfig(mode="rf",
                                    enabled=["mutation_structure", "mutation_parameter"]),
         **overrides,
     })
-    score_cfg = ScoreConfig(lower=0.0, upper=1.0)
-    proposer = FakeProposer(np.random.default_rng(1))
-    evaluator = FakeEvaluator(score_cfg, seeds=(0, 1, 2), rng=np.random.default_rng(2))
-    log_path = tmp_path / "events.jsonl"
-    island = SMCIsland(cfg, proposer, evaluator, EventLogger(log_path, clock=False),
-                       artifact_root=tmp_path / "cand")
-    return island, log_path
 
 
 def test_rf_mode_routes_actions_and_audits(tmp_path):
@@ -236,18 +258,12 @@ def test_generic_mode_has_no_action_metadata(tmp_path):
 
 def _build_rf5(tmp_path: Path, **overrides):
     from eureka.smc.actions import ActionConfig, RF_ACTIONS
-    cfg = SMCIslandConfig(**{
-        "n_particles": 8, "budget": 24, "k_min": 2, "gamma": 1.0, "seed": 0,
+    # children_per_round=8 才能让 rf_ratio [2,2,2,1,1]=8 每轮路由到全部 5 个 action。
+    return _island(FakeProposer(np.random.default_rng(1)), tmp_path, **{
+        "n_particles": 8, "children_per_round": 8, "budget": 24,
         "action_cfg": ActionConfig(mode="rf", enabled=list(RF_ACTIONS)),
         **overrides,
     })
-    score_cfg = ScoreConfig(lower=0.0, upper=1.0)
-    proposer = FakeProposer(np.random.default_rng(1))
-    evaluator = FakeEvaluator(score_cfg, seeds=(0, 1, 2), rng=np.random.default_rng(2))
-    log_path = tmp_path / "events.jsonl"
-    island = SMCIsland(cfg, proposer, evaluator, EventLogger(log_path, clock=False),
-                       artifact_root=tmp_path / "cand")
-    return island, log_path
 
 
 def test_rf5_routes_all_five_actions_and_completes(tmp_path):
