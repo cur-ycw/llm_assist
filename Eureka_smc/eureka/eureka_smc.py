@@ -154,14 +154,15 @@ def main(cfg):
     max_concurrent = algo.evaluation.get("max_concurrent_evals", 6)
     search_seeds = list(algo.evaluation.search_seed_panel)
     reeval = algo.get("reevaluation", None)
-    validation_seeds = list(
-        reeval.validation_seed_panel if reeval is not None and reeval.get("enabled", True)
-        else algo.evaluation.validation_seed_panel
-    )
-    test_seeds = list(
-        reeval.test_seed_panel if reeval is not None and reeval.get("enabled", True)
-        else algo.evaluation.test_seed_panel
-    )
+    reeval_enabled = reeval is not None and reeval.get("enabled", True)
+    validation_enabled = reeval_enabled and reeval.get("validation_enabled", True)
+    if reeval_enabled:
+        # validation 关闭时无中间复评层，validation_seeds 记为空（不占预算、不参与不相交检查）。
+        validation_seeds = list(reeval.validation_seed_panel) if validation_enabled else []
+        test_seeds = list(reeval.test_seed_panel)
+    else:
+        validation_seeds = list(algo.evaluation.validation_seed_panel)
+        test_seeds = list(algo.evaluation.test_seed_panel)
     check_seed_panels(validation_seeds, test_seeds, search_seeds)
     manifest_budget = {
         "n_particles": int(algo.n_particles),
@@ -236,23 +237,35 @@ def main(cfg):
     logging.info(f"Archive size={len(archive)} (deduped valid candidates)")
 
     if reeval is not None and reeval.get("enabled", True) and len(archive) > 0:
-        top_k = int(reeval.get("archive_top_k", 3))
-        val_seeds = list(reeval.validation_seed_panel)
+        validation_enabled = reeval.get("validation_enabled", True)
         test_seeds = list(reeval.test_seed_panel)
-        logging.info(f"Reevaluation: top_k={top_k}, validation={val_seeds}, test={test_seeds}")
-        validation_eval = IsaacGymEvaluator(score_cfg, seeds=val_seeds, prompts=prompts,
-                                            eval_cfg=eval_cfg, cache=False,
-                                            max_concurrent=max_concurrent)
         test_eval = IsaacGymEvaluator(score_cfg, seeds=test_seeds, prompts=prompts,
                                       eval_cfg=eval_cfg, cache=False,
                                       max_concurrent=max_concurrent)
-        vt = run_validation_test(
-            archive, validation_eval, test_eval, top_k=top_k,
-            validation_seeds=val_seeds, test_seeds=test_seeds,
-            artifact_root=workspace_dir / "reeval")
+        if validation_enabled:
+            top_k = int(reeval.get("archive_top_k", 3))
+            val_seeds = list(reeval.validation_seed_panel)
+            logging.info(f"Reevaluation: top_k={top_k}, validation={val_seeds}, test={test_seeds}")
+            validation_eval = IsaacGymEvaluator(score_cfg, seeds=val_seeds, prompts=prompts,
+                                                eval_cfg=eval_cfg, cache=False,
+                                                max_concurrent=max_concurrent)
+            vt = run_validation_test(
+                archive, validation_eval, test_eval, top_k=top_k,
+                validation_seeds=val_seeds, test_seeds=test_seeds,
+                artifact_root=workspace_dir / "reeval")
+            validation_rl_evals = validation_eval.n_evals
+        else:
+            # validation 关闭：冠军直接取 archive search_score top-1，只做 test held-out。
+            logging.info(f"Reevaluation: validation disabled, "
+                         f"champion=archive search_score top-1, test={test_seeds}")
+            vt = run_validation_test(
+                archive, None, test_eval, top_k=1,
+                validation_seeds=[], test_seeds=test_seeds,
+                artifact_root=workspace_dir / "reeval")
+            validation_rl_evals = 0
         test_rec = vt.test_record
         test_per_seed = test_rec.reward_components.get("per_seed", []) if test_rec else []
-        logging.info(f"Validation winner={vt.selected_candidate_id}; "
+        logging.info(f"Champion={vt.selected_candidate_id}; "
                      f"test raw J mean={test_rec.search_score if test_rec else None}, "
                      f"per_seed={test_per_seed}")
         (workspace_dir / "validation_test_result.json").write_text(
@@ -267,7 +280,7 @@ def main(cfg):
             test_search_score=test_rec.search_score if (test_rec and test_rec.search_score is not None) else np.nan,
             test_per_seed=np.array(test_per_seed, dtype=float),
             llm_calls=proposer.n_calls, rl_evals=evaluator.n_evals,
-            validation_rl_evals=validation_eval.n_evals, test_rl_evals=test_eval.n_evals)
+            validation_rl_evals=validation_rl_evals, test_rl_evals=test_eval.n_evals)
     else:
         # 兼容旧路径：单一 best 的 held-out 复评（仅在 reevaluation 关闭时使用）。
         heldout = list(algo.evaluation.heldout_seed_panel)

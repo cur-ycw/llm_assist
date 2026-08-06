@@ -133,3 +133,32 @@ def test_result_to_json_serializes_records():
     assert payload["top_k_candidate_ids"] == ["a"]
     assert payload["validation_records"]["a"]["search_score"] == pytest.approx(0.8)
     assert payload["test_record"]["search_score"] == pytest.approx(0.7)
+
+
+def test_validation_disabled_selects_search_top1_and_skips_validation(tmp_path):
+    # validation_evaluator=None：跳过中间层，冠军=archive search_score 最高者，只做 test。
+    archive = [_particle("mid", 0.80), _particle("search-best", 0.95), _particle("low", 0.60)]
+    test = ScriptedEvaluator((20, 21), {"search-best": 0.7})
+
+    result = run_validation_test(
+        archive, None, test, top_k=3, test_seeds=(20, 21), artifact_root=tmp_path)
+
+    assert result.top_k_candidate_ids == ("search-best",)
+    assert result.selected_candidate_id == "search-best"      # 按 search_score 直接选
+    assert result.selected_validation_record is None
+    assert result.validation_records == {}
+    assert result.validation_seeds == ()                       # 无 validation panel
+    assert result.test_record.search_score == pytest.approx(0.7)
+    assert [call[0] for call in test.calls] == ["search-best"]  # 只测冠军一次
+    assert test.calls[0][2] == tmp_path / "test" / "search-best"
+
+
+def test_validation_disabled_ignores_validation_test_overlap():
+    # 关闭 validation 时不应因 validation panel 而触发不相交检查（validation 为空）。
+    archive = [_particle("a", 0.9)]
+    test = ScriptedEvaluator((20,), {"a": 0.5})
+
+    result = run_validation_test(archive, None, test, test_seeds=(20,))
+
+    assert result.selected_candidate_id == "a"
+    assert result.test_seeds == (20,)

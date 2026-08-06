@@ -93,10 +93,14 @@ checkpoint:
   path: smc_runtime_checkpoint.json
   resume_from: null
 
-# archive top-k → validation → test 三阶段复评（计划 §5 阶段 D）。
-# validation/test 与 search seed 完全不重叠，且彼此不重叠；成本单独记账，不计入 B。
+# archive → (可选 validation) → test 复评（计划 §5 阶段 D）。
+# test 与 search seed 完全不重叠；成本单独记账，不计入 B。
+# 预算有限:默认关闭 validation 中间层(validation_enabled=false),冠军直接取 archive
+# search_score top-1,只做 test held-out。此时 archive_top_k / validation_seed_panel
+# 不生效(仅在 validation_enabled=true 时使用,那时 validation 与 search/test 须两两不重叠)。
 reevaluation:
   enabled: true
-  archive_top_k: 3                                  # 从 archive 取 top-k 进入 validation
-  validation_seed_panel: [200, 201, 202]            # 稳定选唯一候选
-  test_seed_panel: [0, 1, 2, 3, 4]                  # 仅对 validation 冠军做 test;与 champion 基准 seeds0-4 对齐
+  validation_enabled: false                         # 关闭 validation 复评层;冠军=archive search_score top-1
+  archive_top_k: 3                                  # 仅 validation_enabled=true 时:从 archive 取 top-k 进入 validation
+  validation_seed_panel: [200, 201, 202]            # 仅 validation_enabled=true 时:稳定选唯一候选
+  test_seed_panel: [0, 1, 2, 3, 4]                  # 对冠军做 test;与 champion 基准 seeds0-4 对齐

@@ -194,10 +194,30 @@ def run_validation_test(
     ``validation_seeds``/``test_seeds``覆盖结果记录中的 panel（用于轻量替身）；
     seed panel 必须不重叠。validation 平分时按 search top-k 顺序和 candidate id
     稳定决胜，因而每次只会选择一个候选。
+
+    ``validation_evaluator=None`` 时跳过 validation 中间层（预算有限时的精简协议）：
+    冠军直接取 archive 中 ``search_score`` 最高者，再在 test panel 上做唯一的
+    held-out 复评。此模式不消耗 validation 复评开销，``top_k`` 被忽略。
     """
+    test_panel = _evaluator_seeds(test_evaluator, test_seeds, "test seed panel")
+
+    if validation_evaluator is None:
+        champion = select_archive_top_k(archive, 1)[0]
+        cid = _candidate_id(champion)
+        directory = Path(artifact_root) / "test" / cid if artifact_root is not None else None
+        test_record = _evaluate(test_evaluator, _candidate_code(champion), cid, directory)
+        return ValidationTestResult(
+            top_k_candidate_ids=(cid,),
+            validation_records={},
+            selected_candidate_id=cid,
+            selected_validation_record=None,
+            test_record=test_record,
+            validation_seeds=(),
+            test_seeds=test_panel,
+        )
+
     validation_panel = _evaluator_seeds(
         validation_evaluator, validation_seeds, "validation seed panel")
-    test_panel = _evaluator_seeds(test_evaluator, test_seeds, "test seed panel")
     check_seed_panels(validation_panel, test_panel)
 
     top_candidates = select_archive_top_k(archive, top_k)
