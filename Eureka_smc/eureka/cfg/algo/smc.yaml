@@ -27,13 +27,15 @@ budget_protocols:
     budget: 512
     k_min: 8
 
-n_particles: ${budget_protocols.${environment_family}.n_particles}
-children_per_round: ${budget_protocols.${environment_family}.children_per_round}
-init_budget: ${budget_protocols.${environment_family}.init_budget}
-mutation_rounds: ${budget_protocols.${environment_family}.mutation_rounds}
-mutation_budget: ${budget_protocols.${environment_family}.mutation_budget}
-budget: ${budget_protocols.${environment_family}.budget}
-k_min: ${budget_protocols.${environment_family}.k_min}
+# 相对插值(${.} / ${..}):Hydra 用 algo=smc 组合时整个文件被嵌套到 algo 键下,
+# 绝对路径 ${n_particles} 会从根查找而失败;相对插值在独立与嵌套两种加载下都成立。
+n_particles: ${.budget_protocols.${.environment_family}.n_particles}
+children_per_round: ${.budget_protocols.${.environment_family}.children_per_round}
+init_budget: ${.budget_protocols.${.environment_family}.init_budget}
+mutation_rounds: ${.budget_protocols.${.environment_family}.mutation_rounds}
+mutation_budget: ${.budget_protocols.${.environment_family}.mutation_budget}
+budget: ${.budget_protocols.${.environment_family}.budget}
+k_min: ${.budget_protocols.${.environment_family}.k_min}
 
 authority_mode: paper_core   # paper_core | source_compat
 n_islands: 1                 # 首版单岛
@@ -79,7 +81,7 @@ evaluation:
   heldout_seed_panel: [100, 101, 102, 103, 104]    # 旧单-best 复评（兼容保留；Full 用下方 reevaluation）
   cache: true
   # 上限由环境族 population 槽位派生；init 和 mutation 均在容量允许时整批启动。
-  max_concurrent_evals: ${n_particles}
+  max_concurrent_evals: ${..n_particles}
   startup_timeout_seconds: 600                      # 等待训练 import reward 源码的上限；超时会清理子进程
   training_timeout_seconds: 7200                    # 单个 train.py 训练上限；超时会清理子进程
   lock_timeout_seconds: 300                          # 获取跨进程共享 task 注入锁的上限
