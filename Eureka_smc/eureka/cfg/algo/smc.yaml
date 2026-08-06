@@ -99,4 +99,4 @@ reevaluation:
   enabled: true
   archive_top_k: 3                                  # 从 archive 取 top-k 进入 validation
   validation_seed_panel: [200, 201, 202]            # 稳定选唯一候选
-  test_seed_panel: [300, 301, 302, 303, 304]        # 仅对 validation 冠军做 test
+  test_seed_panel: [0, 1, 2, 3, 4]                  # 仅对 validation 冠军做 test;与 champion 基准 seeds0-4 对齐

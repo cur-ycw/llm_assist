@@ -75,7 +75,7 @@ exec python -u eureka_smc.py \
   algo.reevaluation.enabled=true \
   algo.reevaluation.archive_top_k=3 \
   algo.reevaluation.validation_seed_panel='[200,201,202]' \
-  algo.reevaluation.test_seed_panel='[300,301,302,303,304]' \
+  algo.reevaluation.test_seed_panel='[0,1,2,3,4]' \
   algo.checkpoint.enabled=true \
   "algo.checkpoint.path=$CHECKPOINT" \
   'algo.checkpoint.resume_from=null' \
