@@ -119,7 +119,10 @@ def main(cfg):
         suffix=suffix, env_name=env_name, task_code_string=task_code_string,
         output_file=output_file, max_iterations=cfg.policy_train_iterations,
         use_wandb=cfg.use_wandb, wandb_username=cfg.wandb_username,
-        wandb_project=cfg.wandb_project, capture_video=cfg.capture_video)
+        wandb_project=cfg.wandb_project, capture_video=cfg.capture_video,
+        startup_timeout_seconds=algo.evaluation.get("startup_timeout_seconds", 600.0),
+        training_timeout_seconds=algo.evaluation.get("training_timeout_seconds", 7200.0),
+        lock_timeout_seconds=algo.evaluation.get("lock_timeout_seconds", 300.0))
 
     ctx = TaskContext(initial_system=initial_system, initial_user=initial_user,
                       code_output_tip=prompts["code_output_tip"], model=cfg.model,

@@ -55,6 +55,9 @@ evaluation:
   heldout_seed_panel: [100, 101, 102, 103, 104]    # 旧单-best 复评（兼容保留；Full 用下方 reevaluation）
   cache: true
   max_concurrent_evals: 6                           # 每波并发 train.py 上限（3×3090 下 6≈每卡 2 个，给显存留余量）
+  startup_timeout_seconds: 600                      # 等待训练 import reward 源码的上限；超时会清理子进程
+  training_timeout_seconds: 7200                    # 单个 train.py 训练上限；超时会清理子进程
+  lock_timeout_seconds: 300                          # 获取跨进程共享 task 注入锁的上限
 
 # Stage-boundary runtime checkpoint. `resume_from` must point to a checkpoint
 # produced by the same resolved SMC configuration.

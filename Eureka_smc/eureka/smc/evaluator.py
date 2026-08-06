@@ -18,11 +18,15 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Iterator, Mapping, Optional, Sequence
+
+import fcntl
 
 import numpy as np
 
@@ -134,7 +138,12 @@ class IsaacGymEvalConfig:
     def __init__(self, *, isaac_root_dir: str, eureka_root_dir: str, task: str, suffix: str,
                  env_name: str, task_code_string: str, output_file: str,
                  max_iterations: int, use_wandb: bool = False, wandb_username: str = "",
-                 wandb_project: str = "", capture_video: bool = False):
+                 wandb_project: str = "", capture_video: bool = False,
+                 startup_timeout_seconds: float = 600.0,
+                 training_timeout_seconds: float = 7200.0,
+                 lock_timeout_seconds: float = 300.0):
+        if startup_timeout_seconds <= 0 or training_timeout_seconds <= 0 or lock_timeout_seconds <= 0:
+            raise ValueError("Isaac Gym evaluator timeouts must be positive")
         self.isaac_root_dir = isaac_root_dir
         self.eureka_root_dir = eureka_root_dir
         self.task = task
@@ -147,6 +156,9 @@ class IsaacGymEvalConfig:
         self.wandb_username = wandb_username
         self.wandb_project = wandb_project
         self.capture_video = capture_video
+        self.startup_timeout_seconds = float(startup_timeout_seconds)
+        self.training_timeout_seconds = float(training_timeout_seconds)
+        self.lock_timeout_seconds = float(lock_timeout_seconds)
 
 
 class IsaacGymEvaluator(Evaluator):
@@ -168,7 +180,63 @@ class IsaacGymEvaluator(Evaluator):
 
     def _config_salt(self) -> str:
         c = self.cfg
-        return f"{c.task}|{c.suffix}|{c.max_iterations}|{c.env_name}"
+        return (f"{c.task}|{c.suffix}|{c.max_iterations}|{c.env_name}|"
+                f"startup_timeout={c.startup_timeout_seconds}|"
+                f"training_timeout={c.training_timeout_seconds}|"
+                f"lock_timeout={c.lock_timeout_seconds}")
+
+    @property
+    def _lock_path(self) -> Path:
+        return Path(f"{self.cfg.output_file}.smc.lock")
+
+    @contextmanager
+    def _task_write_lock(self) -> Iterator[None]:
+        """跨 evaluator 进程串行化共享 task 文件的写入和 import 启动窗口。"""
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._lock_path, "a+") as lock_file:
+            deadline = time.monotonic() + self.cfg.lock_timeout_seconds
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"Timed out waiting {self.cfg.lock_timeout_seconds:.1f}s for shared task lock "
+                            f"{self._lock_path}")
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _terminate_process(proc, grace_seconds: float = 15.0) -> None:
+        """停止并回收超时训练进程，避免遗留 GPU worker。"""
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    def _wait_for_training_start(self, rl_filepath: str, u) -> None:
+        """在有限时间内等待训练启动或 traceback，避免共享写入门无限阻塞。"""
+        deadline = time.monotonic() + self.cfg.startup_timeout_seconds
+        while True:
+            try:
+                with open(rl_filepath) as log_file:
+                    rl_log = log_file.read()
+            except FileNotFoundError:
+                rl_log = ""
+            if "fps step:" in rl_log or "Traceback" in rl_log:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"training_start_timeout after {self.cfg.startup_timeout_seconds:.1f}s")
+            time.sleep(1.0)
 
     # ---- 延迟导入 utils（真实运行时 cwd 在 eureka/）----
     @staticmethod
@@ -207,31 +275,44 @@ class IsaacGymEvaluator(Evaluator):
                 "from torch import Tensor\n" + body + "\n")
 
     def _launch_seed(self, env_code: str, seed: int, artifact_dir: Path, u):
-        """写共享 output_file → 启动 train.py → block_until_training（等它 import 完）。
-
-        返回 (proc, rl_filepath)。调用者必须在写下一个候选的 output_file **之前**完成本次
-        block_until_training（已在此函数内），从而共享文件写入被串起来、训练本身并发。
-        """
-        u["set_freest_gpu"]()
-        with open(self.cfg.output_file, "w") as f:
-            f.write(env_code)
+        """在锁内写共享 task 文件、启动训练并等待它消费源码。"""
         rl_filepath = str(artifact_dir / f"train_seed{seed}.txt")
-        c = self.cfg
-        with open(rl_filepath, "w") as f:
-            proc = subprocess.Popen(
-                ["python", "-u", f"{c.isaac_root_dir}/train.py", "hydra/output=subprocess",
-                 f"task={c.task}{c.suffix}", f"wandb_activate={c.use_wandb}",
-                 f"wandb_entity={c.wandb_username}", f"wandb_project={c.wandb_project}",
-                 f"headless={not c.capture_video}", f"capture_video={c.capture_video}",
-                 "force_render=False", f"max_iterations={c.max_iterations}", f"seed={seed}"],
-                stdout=f, stderr=f)
-        u["block_until_training"](rl_filepath)
-        return proc, rl_filepath
+        proc = None
+        try:
+            with self._task_write_lock():
+                u["set_freest_gpu"]()
+                with open(self.cfg.output_file, "w") as f:
+                    f.write(env_code)
+                c = self.cfg
+                with open(rl_filepath, "w") as f:
+                    proc = subprocess.Popen(
+                        ["python", "-u", f"{c.isaac_root_dir}/train.py", "hydra/output=subprocess",
+                         f"task={c.task}{c.suffix}", f"wandb_activate={c.use_wandb}",
+                         f"wandb_entity={c.wandb_username}", f"wandb_project={c.wandb_project}",
+                         f"headless={not c.capture_video}", f"capture_video={c.capture_video}",
+                         "force_render=False", f"max_iterations={c.max_iterations}", f"seed={seed}"],
+                        stdout=f, stderr=f)
+                self._wait_for_training_start(rl_filepath, u)
+            return proc, rl_filepath, ""
+        except Exception as exc:
+            if proc is not None:
+                self._terminate_process(proc)
+            with open(rl_filepath, "a") as f:
+                f.write(f"\n[SMC evaluator launch failure] {type(exc).__name__}: {exc}\n")
+            return None, rl_filepath, f"launch_error:{type(exc).__name__}: {exc}"
 
-    @staticmethod
-    def _collect_seed(proc, rl_filepath: str, u) -> tuple[Optional[dict], str, str]:
-        """等一个已启动的 train.py 跑完并解析，返回 (tensorboard_logs|None, stdout_path, tb)。"""
-        proc.communicate()
+    def _collect_seed(self, proc, rl_filepath: str, u) -> tuple[Optional[dict], str, str]:
+        """等待一个已启动的 train.py 跑完并解析，带训练超时及进程清理。"""
+        if proc is None:
+            return None, rl_filepath, "launch_error:no_process"
+        try:
+            proc.communicate(timeout=self.cfg.training_timeout_seconds)
+        except subprocess.TimeoutExpired:
+            self._terminate_process(proc)
+            error = f"training_timeout after {self.cfg.training_timeout_seconds:.1f}s"
+            with open(rl_filepath, "a") as f:
+                f.write(f"\n[SMC evaluator timeout] {error}\n")
+            return None, rl_filepath, error
         with open(rl_filepath) as f:
             stdout_str = f.read()
         tb = u["filter_traceback"](stdout_str)
@@ -244,7 +325,10 @@ class IsaacGymEvaluator(Evaluator):
                 break
         if not tb_dir:
             return None, rl_filepath, "No Tensorboard Directory in stdout."
-        return u["load_tensorboard_logs"](tb_dir), rl_filepath, ""
+        try:
+            return u["load_tensorboard_logs"](tb_dir), rl_filepath, ""
+        except Exception as exc:
+            return None, rl_filepath, f"tensorboard_parse_error:{type(exc).__name__}: {exc}"
 
     def _build_feedback(self, logs: Mapping) -> str:
         """镜像官方 eureka.py:243-279 的反馈构造。"""
@@ -345,10 +429,11 @@ class IsaacGymEvaluator(Evaluator):
         for wave in _chunks(units, self.max_concurrent):
             launched = []
             for key, seed in wave:  # 串行 launch：写→启动→等 import（门控共享文件）
-                proc, rl = self._launch_seed(env_by_key[key], seed, dir_by_key[key], u)
-                launched.append((key, seed, proc, rl))
-            for key, seed, proc, rl in launched:  # 统一 collect：并发训练在此汇合
-                seed_results[key][seed] = self._collect_seed(proc, rl, u)
+                proc, rl, launch_error = self._launch_seed(env_by_key[key], seed, dir_by_key[key], u)
+                launched.append((key, seed, proc, rl, launch_error))
+            for key, seed, proc, rl, launch_error in launched:  # 统一 collect：并发训练在此汇合
+                seed_results[key][seed] = (
+                    (None, rl, launch_error) if launch_error else self._collect_seed(proc, rl, u))
 
         for key in runnable:
             recs[key] = self._aggregate(seed_results[key], dir_by_key[key], t0_by_key[key])
