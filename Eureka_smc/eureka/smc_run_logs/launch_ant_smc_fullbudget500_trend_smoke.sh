@@ -37,9 +37,9 @@ if [[ ! -f "$ANTGPT" ]]; then
   exit 1
 fi
 
-if pgrep -af 'train.py.*AntGPT|eureka_smc.py' >/dev/null; then
+if pgrep -af 'eureka_smc.py|train.py.*task=AntGPT|task=AntGPT.*train.py' >/dev/null; then
   echo "Refusing to start: an AntGPT trainer or SMC driver is already active." >&2
-  pgrep -af 'train.py.*AntGPT|eureka_smc.py' >&2 || true
+  pgrep -af 'eureka_smc.py|train.py.*task=AntGPT|task=AntGPT.*train.py' >&2 || true
   exit 1
 fi
 
@@ -63,7 +63,7 @@ export EUREKA_KEY_INDEX
   nvidia-smi || true
   gpustat --json || true
   echo "gpu_inventory_end"
-  echo "frozen_protocol=N=16 init=16 M=8 R=8 mutation=64 B=80 ppo=500 search=[42] validation=[200,201,202] test=[300,301,302,303,304] concurrency=3"
+  echo "frozen_protocol=N=16 init=16 M=8 R=8 mutation=64 B=80 ppo=500 search=[42] validation=[200,201,202] test=[300,301,302,303,304] all-candidates-per-stage-parallel"
 } | tee "$LAUNCH_LOG"
 
 exec python -u eureka_smc.py \
@@ -79,7 +79,8 @@ exec python -u eureka_smc.py \
   algo.k_min=2 \
   algo.seed=0 \
   algo.evaluation.search_seed_panel='[42]' \
-  algo.evaluation.max_concurrent_evals=3 \
+  algo.evaluation.max_concurrent_evals=16 \
+  algo.evaluation.cache=false \
   algo.evaluation.startup_timeout_seconds=600 \
   algo.evaluation.training_timeout_seconds=7200 \
   algo.evaluation.lock_timeout_seconds=300 \

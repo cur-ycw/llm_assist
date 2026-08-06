@@ -165,18 +165,19 @@ class IsaacGymEvaluator(Evaluator):
     """真实评估器：注入奖励代码 → 训练 → 解析 tensorboard → 构造反馈。
 
     ``evaluate``（单个）仍走共享 ``output_file`` 的路径；``evaluate_batch`` 做**伪并行**：
-    一个驱动进程按“写 output_file → Popen train.py → block_until_training（等它 import 完，
-    非训练结束）→ 写下一个”把一波候选铺开，靠 ``block_until_training`` 门控共享文件写入，
-    再统一 ``communicate`` 收集。``set_freest_gpu`` 每次挑最空卡 → 自动摊到多张 GPU。每波
-    至多 ``max_concurrent`` 个子进程并发，给显存留余量。
+    一个驱动进程按“写 output_file → Popen train.py → 等它 import 完（非训练结束）→ 写下一个”
+    把一波候选铺开，靠短时共享写入锁门控 reward 文件注入，再统一 ``communicate`` 收集。
+    每波至多 ``max_concurrent`` 个子进程并发；当它覆盖整批 candidate 时，所有候选会同批训练。
     """
 
     def __init__(self, score_cfg, seeds, prompts: Mapping[str, str],
                  eval_cfg: IsaacGymEvalConfig, cache: bool = True, max_concurrent: int = 6):
         super().__init__(score_cfg, seeds, cache)
+        if max_concurrent <= 0:
+            raise ValueError("max_concurrent must be positive")
         self.prompts = prompts
         self.cfg = eval_cfg
-        self.max_concurrent = max_concurrent  # 每波并发子进程上限（3 卡下 6≈每卡 2 个）
+        self.max_concurrent = int(max_concurrent)
 
     def _config_salt(self) -> str:
         c = self.cfg
