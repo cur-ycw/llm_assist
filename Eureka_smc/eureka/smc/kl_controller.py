@@ -1,210 +1,462 @@
-"""预算条件化的 KL 父代选择控制器（新方法：预算与进展自适应 SMC 奖励搜索 §2.3–2.4）。
+"""预算—进展自适应的 KL 父代选择控制器。
 
-替换原 ESS 自适应退火桥（``temperature.py``）。核心思想：**父代选择的集中度只由剩余
-LLM 修改预算决定**，不看 ESS、近期成功率或 EMA。
+Full 控制器以二阶矩相对有效样本数
+``rESS(q) = 1 / (N * sum(q**2))`` 为目标。预算给出基础目标，上一轮的
+``Gamma`` 只经由延迟反馈修正下一轮目标：
 
-一轮的解算链（``resolve``）：
-  1. 目标有效父代数        K*_t = K_min + (N-K_min)·(b_t/B)^γ      —— 预算足→N，预算尽→K_min
-  2. 目标 KL 半径          δ_t  = log(N / K*_t)
-  3. 并列可行性修正        m 个并列最高分 → K_feas = max(K*, m)，δ_feas = log(N/K_feas)
-  4. 一维二分反解 λ_t       使   KL( softmax(λ_t·J) ‖ U_N ) = δ_feas
-  5. 父代分布              q_t  = softmax(λ_t·J)         （J 为**原始**任务性能，不归一化）
+``tau = clip(tau_budget(h) * exp(-eta * h * Gamma_prev), k_min/N, 1)``。
 
-可达时 K_eff = exp(H(q_t)) = N·exp(-δ_t) = K*_t。全体同分退化为 q=U_N, λ=0。
-
-一切纯 numpy、无 Isaac Gym / LLM，因此可完整单测（对应实验计划 §6 阶段 A 检查表 1–13）。
-数值稳定：softmax 统一减去当轮最大 logit（log-sum-exp），该平移不改变分布、不构成奖励
-标准化（§2.2）。``q=softmax(λ(aJ+b))`` 关于正仿射 (a>0) 不变：λ 随 1/a 缩放、λ·Δ 不变。
+选择分布仍为原始任务分数 ``J`` 上的 Boltzmann--Gibbs 分布；默认
+``W=uniform, U=J``。小写 ``gamma`` 是旧预算幂日程的兼容参数，不参与
+Full 控制器计算。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 
 __all__ = [
     "ControllerStep",
     "target_effective_parents",
+    "tau_budget",
+    "target_relative_ess",
     "boltzmann_gibbs",
+    "boltzmann_gibbs_dimensionless",
+    "normalize_potential",
     "shannon_entropy",
+    "entropy_effective_parents",
     "effective_parents",
+    "relative_ess",
     "kl_to_uniform",
     "feasible_target",
+    "feasible_relative_ess",
     "solve_lambda",
+    "solve_lambda_for_ress",
+    "solve_alpha_for_ress",
     "resolve",
 ]
 
 _EPS = 1e-12
 
 
-def target_effective_parents(
-    b: float, B: float, n: int, k_min: float, gamma: float
+def _probabilities(q: Sequence[float], name: str = "q") -> np.ndarray:
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    if q.size == 0 or not np.all(np.isfinite(q)) or np.any(q < 0.0):
+        raise ValueError(f"{name} must be a non-empty finite non-negative vector")
+    total = float(q.sum())
+    if total <= 0.0:
+        raise ValueError(f"{name} must have positive mass")
+    return q / total
+
+
+def _scores(scores: Sequence[float]) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if scores.size == 0 or not np.all(np.isfinite(scores)):
+        raise ValueError("scores must be a non-empty finite vector")
+    return scores
+
+
+def tau_budget(h: float, k_min: float, n: int) -> float:
+    """Budget-only rESS target, linearly interpolated from ``k_min/n`` to one."""
+    if n <= 0:
+        raise ValueError("n must be positive")
+    h = float(np.clip(h, 0.0, 1.0))
+    tau_floor = float(np.clip(k_min, 1.0, n)) / float(n)
+    return float(tau_floor + (1.0 - tau_floor) * h)
+
+
+def target_relative_ess(
+    b: float,
+    B: float,
+    n: int,
+    k_min: float,
+    eta: float = 1.0,
+    progress_prev: float = 0.0,
 ) -> float:
-    """目标有效父代数 ``K*_t = K_min + (N-K_min)·(b/B)^γ``，clip 到 ``[K_min, N]``。
+    """Return the delayed-progress target rESS.
 
-    ``b`` 为**本轮开始时**的剩余修改预算，``B`` 为总修改预算。预算充足（b≈B）时 K*≈N（广探），
-    预算耗尽（b≈0）时 K*→K_min（集中）。近期成功率/EMA/目标成功率均不进入（§2.3）。
+    Positive preceding progress makes the next-round parent allocation more
+    concentrated; negative progress preserves more diversity.  ``progress_prev``
+    is clipped to the natural ``[-1, 1]`` range of Gamma.
     """
-    if B <= 0 or n <= 0:
+    if B <= 0.0 or n <= 0:
         raise ValueError("B and n must be positive")
-    k_min = float(np.clip(k_min, 1.0, n))
-    frac = float(np.clip(b / B, 0.0, 1.0))
-    k_star = k_min + (n - k_min) * (frac ** gamma)
-    return float(np.clip(k_star, k_min, float(n)))
+    if not np.isfinite(eta) or eta < 0.0:
+        raise ValueError("eta must be finite and non-negative")
+    if not np.isfinite(progress_prev):
+        raise ValueError("progress_prev must be finite")
+    h = float(np.clip(b / B, 0.0, 1.0))
+    floor = float(np.clip(k_min, 1.0, n)) / float(n)
+    base = tau_budget(h, k_min, n)
+    gamma_prev = float(np.clip(progress_prev, -1.0, 1.0))
+    return float(np.clip(base * np.exp(-eta * h * gamma_prev), floor, 1.0))
 
 
-def boltzmann_gibbs(scores: np.ndarray, lam: float) -> np.ndarray:
-    """父代选择分布 ``q(i) = softmax(λ·J_i)``，log-sum-exp 稳定（减最大 logit）。
+def target_effective_parents(
+    b: float,
+    B: float,
+    n: int,
+    k_min: float,
+    gamma: Optional[float] = None,
+    *,
+    eta: float = 1.0,
+    progress_prev: float = 0.0,
+) -> float:
+    """Legacy budget-power helper; Full ``resolve`` does not call it.
 
-    ``λ=0`` → 均匀；``λ→∞`` → 质量集中到最高分（有并列则均分给并列者）。全体同分对任意
-    λ 都返回均匀分布。
+    The argument remains available for old analysis code.  Full control must use
+    :func:`target_relative_ess`, where ``eta`` and delayed ``Gamma`` are active.
     """
-    scores = np.asarray(scores, dtype=np.float64)
+    if gamma is not None:
+        if B <= 0 or n <= 0 or not np.isfinite(gamma) or gamma < 0:
+            raise ValueError("B and n must be positive; gamma must be non-negative")
+        k_floor = float(np.clip(k_min, 1.0, n))
+        frac = float(np.clip(b / B, 0.0, 1.0))
+        return float(np.clip(k_floor + (n - k_floor) * frac ** gamma, k_floor, n))
+    return float(n * target_relative_ess(b, B, n, k_min, eta, progress_prev))
+
+
+def boltzmann_gibbs(
+    scores: Sequence[float], lam: float, weights: Optional[Sequence[float]] = None
+) -> np.ndarray:
+    """Return ``q(i) ∝ W_i exp(lambda * J_i)`` with stable log-sum-exp.
+
+    Omitting ``weights`` gives the Full default ``W=uniform``.  Zero prior weights
+    are supported and remain zero.
+    """
+    scores = _scores(scores)
     n = scores.size
-    if n == 0:
-        return np.empty(0, dtype=np.float64)
-    logits = lam * scores
-    logits = logits - logits.max()          # 平移不改变 softmax（§2.2）
-    w = np.exp(logits)
-    s = w.sum()
-    if not np.isfinite(s) or s <= 0.0:       # 极端 λ 下的兜底
-        return np.full(n, 1.0 / n)
-    return w / s
+    if not np.isfinite(lam) or lam < 0.0:
+        raise ValueError("lam must be finite and non-negative")
+    prior = np.full(n, 1.0 / n) if weights is None else _probabilities(weights, "weights")
+    if prior.size != n:
+        raise ValueError("weights must match scores")
+    positive = prior > 0.0
+    logits = np.full(n, -np.inf, dtype=np.float64)
+    logits[positive] = np.log(prior[positive]) + float(lam) * scores[positive]
+    shift = float(np.max(logits))
+    masses = np.zeros(n, dtype=np.float64)
+    masses[positive] = np.exp(logits[positive] - shift)
+    return masses / masses.sum()
 
 
-def shannon_entropy(q: np.ndarray) -> float:
-    """香农熵 ``H(q) = -Σ q_i log q_i``（nat）。"""
-    q = np.asarray(q, dtype=np.float64)
+def normalize_potential(potential: Sequence[float]) -> tuple[np.ndarray, float]:
+    """Map a finite potential to ``[-1, 0]`` and return its range.
+
+    The exact zero-range case is handled without introducing an arbitrary
+    numerical threshold: a constant potential carries no ranking signal.
+    """
+    values = _scores(potential)
+    maximum = float(values.max())
+    span = float(values.max() - values.min())
+    if span == 0.0:
+        return np.zeros_like(values), 0.0
+    normalized = (values - maximum) / span
+    return normalized, span
+
+
+def boltzmann_gibbs_dimensionless(
+    normalized_potential: Sequence[float],
+    alpha: float,
+    weights: Optional[Sequence[float]] = None,
+) -> np.ndarray:
+    """Return ``q(i) ∝ W_i exp(alpha * U_tilde_i)`` stably."""
+    values = _scores(normalized_potential)
+    if not np.isfinite(alpha) or alpha < 0.0:
+        raise ValueError("alpha must be finite and non-negative")
+    prior = np.full(values.size, 1.0 / values.size) if weights is None else _probabilities(weights, "weights")
+    if prior.size != values.size:
+        raise ValueError("weights must match normalized_potential")
+    positive = prior > 0.0
+    logits = np.full(values.size, -np.inf, dtype=np.float64)
+    logits[positive] = np.log(prior[positive]) + float(alpha) * values[positive]
+    shift = float(np.max(logits))
+    masses = np.zeros(values.size, dtype=np.float64)
+    masses[positive] = np.exp(logits[positive] - shift)
+    return masses / masses.sum()
+
+
+def shannon_entropy(q: Sequence[float]) -> float:
+    """Shannon entropy ``H(q)`` (nats), retained as a diagnostic."""
+    q = _probabilities(q)
     nz = q > _EPS
     return float(-(q[nz] * np.log(q[nz])).sum())
 
 
-def effective_parents(q: np.ndarray) -> float:
-    """有效父代数 ``K_eff = exp(H(q))``（∈ [1, N]）。"""
+def effective_parents(q: Sequence[float]) -> float:
+    """Second-moment effective parent count ``1 / sum(q**2)``."""
+    q = _probabilities(q)
+    return float(1.0 / np.square(q).sum())
+
+
+def entropy_effective_parents(q: Sequence[float]) -> float:
+    """Shannon-entropy effective count, retained as a diagnostic only."""
     return float(np.exp(shannon_entropy(q)))
 
 
-def kl_to_uniform(q: np.ndarray) -> float:
-    """``D_KL(q ‖ U_N) = log N - H(q) = Σ q_i log(q_i·N)``（∈ [0, log N]）。"""
-    q = np.asarray(q, dtype=np.float64)
-    n = q.size
-    if n <= 1:
-        return 0.0
-    return float(np.log(n) - shannon_entropy(q))
+def relative_ess(q: Sequence[float]) -> float:
+    """Second-moment relative ESS ``1 / (N * sum(q**2))``."""
+    q = _probabilities(q)
+    return float(1.0 / (q.size * np.square(q).sum()))
+
+
+def kl_to_uniform(q: Sequence[float]) -> float:
+    """``D_KL(q || U_N)`` retained as a diagnostic field."""
+    q = _probabilities(q)
+    return float(np.log(q.size) - shannon_entropy(q)) if q.size > 1 else 0.0
 
 
 def feasible_target(
-    scores: np.ndarray, k_star: float, n: int
+    scores: Sequence[float], k_star: float, n: Optional[int] = None
 ) -> tuple[float, float, int]:
-    """并列可行性修正：返回 ``(K_feas, δ_feas, m_ties)``。
-
-    若有 ``m`` 个并列最高分粒子，则可达的最集中分布把质量均分给这 m 个 → 有效父代数不可能
-    低于 m。故 ``K_feas = max(K*, m)``、``δ_feas = log(N/K_feas)``（§2.4）。不人为打破并列。
-    """
-    scores = np.asarray(scores, dtype=np.float64)
-    if scores.size == 0:
-        return float(k_star), 0.0, 0
-    mx = scores.max()
-    m_ties = int(np.count_nonzero(scores >= mx - _EPS))
-    k_feas = max(float(k_star), float(m_ties))
-    k_feas = min(k_feas, float(n))
-    delta_feas = float(np.log(n / k_feas)) if k_feas > 0 else 0.0
-    return k_feas, delta_feas, m_ties
+    """Legacy KL-target feasibility tuple ``(K_feas, delta_feas, m_ties)``."""
+    scores = _scores(scores)
+    n = scores.size if n is None else int(n)
+    if n != scores.size:
+        raise ValueError("n must equal the number of scores")
+    m_ties = int(np.count_nonzero(np.abs(scores - scores.max()) <= _EPS))
+    k_feas = float(np.clip(max(float(k_star), float(m_ties)), 1.0, n))
+    return k_feas, float(np.log(n / k_feas)), m_ties
 
 
-def solve_lambda(
-    scores: np.ndarray,
-    delta: float,
+def feasible_relative_ess(
+    scores: Sequence[float], target_ress: float, n: Optional[int] = None
+) -> tuple[float, float, int]:
+    """Tie-aware rESS feasibility tuple ``(tau_feasible, K_feasible, m_ties)``."""
+    scores = _scores(scores)
+    n = scores.size if n is None else int(n)
+    if n != scores.size:
+        raise ValueError("n must equal the number of scores")
+    m_ties = int(np.count_nonzero(np.abs(scores - scores.max()) <= _EPS))
+    tau_feasible = max(float(target_ress), float(m_ties) / n)
+    return tau_feasible, float(n * tau_feasible), m_ties
+
+
+def solve_lambda_for_ress(
+    scores: Sequence[float],
+    target_ress: float,
+    weights: Optional[Sequence[float]] = None,
     lam_hi: float = 1.0,
     max_expand: int = 60,
     tol: float = 1e-6,
 ) -> tuple[float, float, bool]:
-    """一维二分反解 ``λ`` 使 ``D_KL(softmax(λ·J) ‖ U_N) = δ``。
-
-    KL(λ) 关于 λ 单调不减（λ 越大分布越集中），故二分良定义。返回 ``(λ, kl_actual, saturated)``：
-      * 全体同分 或 ``δ ≤ tol``：``(0.0, 0.0, False)``（§2.4 全同分退化）；
-      * ``δ`` 超过可达上界（受并列限制，即使很大的 λ 也够不到）：取能达到的最大 λ，
-        置 ``saturated=True``（``kl_saturated`` 诊断，§8.5）；
-      * 否则二分到容差内。``lam_hi`` 不足时按需倍增扩张（至多 ``max_expand`` 次）。
-    """
-    scores = np.asarray(scores, dtype=np.float64)
+    """Solve ``rESS(softmax(log W + lambda*J)) = target_ress`` by bisection."""
+    scores = _scores(scores)
     n = scores.size
-    if n <= 1:
-        return 0.0, 0.0, False
-    spread = float(scores.max() - scores.min())
-    if spread <= _EPS or delta <= tol:       # 全同分 或 目标≈均匀
-        return 0.0, 0.0, False
+    if not np.isfinite(target_ress) or not 0.0 < target_ress <= 1.0:
+        raise ValueError("target_ress must lie in (0, 1]")
+    q0 = boltzmann_gibbs(scores, 0.0, weights)
+    ress0 = relative_ess(q0)
+    if target_ress >= ress0 - tol or n == 1:
+        return 0.0, ress0, False
+    support = q0 > 0.0
+    if np.ptp(scores[support]) <= _EPS:
+        return 0.0, ress0, True
 
-    def kl_at(lam: float) -> float:
-        return kl_to_uniform(boltzmann_gibbs(scores, lam))
+    def ress_at(lam: float) -> float:
+        return relative_ess(boltzmann_gibbs(scores, lam, weights))
 
-    # 扩张上界，直到 KL(lam_hi) 追过 δ 或饱和（并列封顶使 KL 无法再升）。
     hi = float(lam_hi)
-    expand = 0
-    while kl_at(hi) < delta and expand < max_expand:
-        prev = kl_at(hi)
-        hi *= 2.0
-        expand += 1
-        if kl_at(hi) - prev < tol:           # KL 已封顶（并列限制），再升 λ 无用
+    if not np.isfinite(hi) or hi <= 0.0:
+        raise ValueError("lam_hi must be finite and positive")
+    prev = ress_at(hi)
+    for _ in range(max_expand):
+        if prev <= target_ress:
             break
-    kl_hi = kl_at(hi)
-    if kl_hi < delta - tol:                   # 请求的 δ 不可达 → 饱和
-        return float(hi), float(kl_hi), True
+        nxt = ress_at(hi * 2.0)
+        hi *= 2.0
+        if abs(nxt - prev) < tol:
+            prev = nxt
+            break
+        prev = nxt
+    if prev > target_ress + tol:
+        return hi, prev, True
 
     lo = 0.0
     while hi - lo > tol:
-        mid = 0.5 * (lo + hi)
-        if kl_at(mid) < delta:
+        mid = (lo + hi) / 2.0
+        if ress_at(mid) > target_ress:
             lo = mid
         else:
             hi = mid
-    lam = 0.5 * (lo + hi)
+    lam = (lo + hi) / 2.0
+    return float(lam), float(ress_at(lam)), False
+
+
+def solve_alpha_for_ress(
+    normalized_potential: Sequence[float],
+    target_ress: float,
+    weights: Optional[Sequence[float]] = None,
+    alpha_hi: float = 1.0,
+    max_expand: int = 60,
+    tol: float = 1e-6,
+) -> tuple[float, float, bool]:
+    """Solve rESS in the dimensionless ``alpha`` coordinate."""
+    values = _scores(normalized_potential)
+    n = values.size
+    if not np.isfinite(target_ress) or not 0.0 < target_ress <= 1.0:
+        raise ValueError("target_ress must lie in (0, 1]")
+    q0 = boltzmann_gibbs_dimensionless(values, 0.0, weights)
+    ress0 = relative_ess(q0)
+    if target_ress >= ress0 - tol or n == 1:
+        return 0.0, ress0, False
+    support = q0 > 0.0
+    if np.ptp(values[support]) <= _EPS:
+        return 0.0, ress0, True
+
+    def ress_at(alpha: float) -> float:
+        return relative_ess(boltzmann_gibbs_dimensionless(values, alpha, weights))
+
+    hi = float(alpha_hi)
+    if not np.isfinite(hi) or hi <= 0.0:
+        raise ValueError("alpha_hi must be finite and positive")
+    prev = ress_at(hi)
+    for _ in range(max_expand):
+        if prev <= target_ress:
+            break
+        nxt = ress_at(hi * 2.0)
+        hi *= 2.0
+        if abs(nxt - prev) < tol:
+            prev = nxt
+            break
+        prev = nxt
+    if prev > target_ress + tol:
+        return hi, prev, True
+
+    lo = 0.0
+    while hi - lo > tol:
+        mid = (lo + hi) / 2.0
+        if ress_at(mid) > target_ress:
+            lo = mid
+        else:
+            hi = mid
+    alpha = (lo + hi) / 2.0
+    return float(alpha), float(ress_at(alpha)), False
+
+
+def solve_lambda(
+    scores: Sequence[float], delta: float, lam_hi: float = 1.0,
+    max_expand: int = 60, tol: float = 1e-6,
+) -> tuple[float, float, bool]:
+    """Legacy KL solver retained for source compatibility.
+
+    Full calls :func:`solve_lambda_for_ress`; this function does not control Full.
+    """
+    scores = _scores(scores)
+    if scores.size <= 1:
+        return 0.0, 0.0, False
+    if delta <= tol or np.ptp(scores) <= _EPS:
+        return 0.0, 0.0, False
+    target_kl = float(np.clip(delta, 0.0, np.log(scores.size)))
+    def kl_at(lam: float) -> float:
+        return kl_to_uniform(boltzmann_gibbs(scores, lam))
+    hi = float(lam_hi)
+    prev = kl_at(hi)
+    for _ in range(max_expand):
+        if prev >= target_kl:
+            break
+        nxt = kl_at(hi * 2.0)
+        hi *= 2.0
+        if abs(nxt - prev) < tol:
+            prev = nxt
+            break
+        prev = nxt
+    if prev < target_kl - tol:
+        return hi, prev, True
+    lo = 0.0
+    while hi - lo > tol:
+        mid = (lo + hi) / 2.0
+        if kl_at(mid) < target_kl:
+            lo = mid
+        else:
+            hi = mid
+    lam = (lo + hi) / 2.0
     return float(lam), float(kl_at(lam)), False
 
 
 @dataclass
 class ControllerStep:
-    """一轮控制器解算的完整快照（供 island 派发 + §8.4 诊断日志）。"""
+    """Complete, auditable solution of one Full controller round."""
 
-    k_star: float           # 目标有效父代数
-    k_feas: float           # 并列修正后的可行目标
-    m_ties: int             # 并列最高分粒子数
-    delta_req: float        # 请求 KL 半径 log(N/K*)
-    delta_feas: float       # 可行 KL 半径 log(N/K_feas)
-    lam: float              # 反解出的选择强度 λ_t
-    kl_actual: float        # q_t 实际达到的 KL
-    k_eff: float            # exp(H(q_t))，可达时≈K*
-    q: np.ndarray           # 父代选择分布
-    max_q: float            # max_i q_t(i)
-    saturated: bool         # KL 是否饱和（够不到请求 δ）
+    h: float
+    tau_budget: float
+    progress_prev: float
+    tau_target: float
+    tau_feasible: float
+    relative_ess: float
+    k_eff: float
+    kl_actual: float
+    alpha: float
+    potential_span: float
+    normalized_potential: np.ndarray
+    lambda_equivalent: float
+    q: np.ndarray
+    max_q: float
+    saturated: bool
+    # Legacy diagnostics kept because island's existing event fields read them.
+    k_star: float
+    k_feas: float
+    m_ties: int
+    delta_req: float
+    delta_feas: float
+
+    @property
+    def lam(self) -> float:
+        """Deprecated raw-scale diagnostic; equivalent to ``alpha / span``."""
+        return self.lambda_equivalent
 
 
 def resolve(
-    scores: np.ndarray,
+    scores: Sequence[float],
     b: float,
     B: float,
     n: int,
     k_min: float,
-    gamma: float,
+    gamma: Optional[float] = None,
     lam_hi: float = 1.0,
     tol: float = 1e-6,
+    *,
+    eta: float = 1.0,
+    progress_prev: float = 0.0,
+    weights: Optional[Sequence[float]] = None,
+    U: Optional[Sequence[float]] = None,
 ) -> ControllerStep:
-    """预算 → K* → δ → λ → q 的一次完整解算（§2.3–2.5 选择部分）。
+    """Resolve one round from budget plus the *previous* round's Gamma.
 
-    ``scores`` 为当前 N 个粒子的**原始** J（无效粒子的分数应在调用前替换为有限占位或被过滤；
-    本控制器假定输入均为有限实数）。返回 ``ControllerStep``。
+    ``gamma`` is accepted for old callers (including the untouched island), but is
+    ignored.  ``U`` is the optional explicit Full utility and defaults to ``scores``.
     """
-    scores = np.asarray(scores, dtype=np.float64)
-    k_star = target_effective_parents(b, B, n, k_min, gamma)
-    k_feas, delta_feas, m_ties = feasible_target(scores, k_star, n)
-    delta_req = float(np.log(n / k_star)) if k_star > 0 else 0.0
-    lam, kl_actual, saturated = solve_lambda(scores, delta_feas, lam_hi=lam_hi, tol=tol)
-    q = boltzmann_gibbs(scores, lam)
+    del gamma
+    raw_scores = _scores(scores)
+    utility = raw_scores if U is None else _scores(U)
+    if utility.size != raw_scores.size or n != raw_scores.size:
+        raise ValueError("n, scores, and U must have the same length")
+    h = float(np.clip(b / B, 0.0, 1.0)) if B > 0.0 else (_ for _ in ()).throw(ValueError("B must be positive"))
+    tau_b = tau_budget(h, k_min, n)
+    tau_target = target_relative_ess(b, B, n, k_min, eta, progress_prev)
+    normalized, span = normalize_potential(utility)
+    if span == 0.0:
+        tau_feas, k_feas, m_ties = 1.0, float(n), n
+        alpha, ress, saturated = 0.0, 1.0, False
+        q = boltzmann_gibbs_dimensionless(normalized, alpha, weights)
+    else:
+        tau_feas, k_feas, m_ties = feasible_relative_ess(utility, tau_target, n)
+        alpha, ress, saturated = solve_alpha_for_ress(
+            normalized, tau_feas, weights, alpha_hi=lam_hi, tol=tol
+        )
+        q = boltzmann_gibbs_dimensionless(normalized, alpha, weights)
+    lambda_equivalent = alpha / span if span > 0.0 else 0.0
+    k_star = float(n * tau_target)
     return ControllerStep(
-        k_star=k_star, k_feas=k_feas, m_ties=m_ties,
-        delta_req=delta_req, delta_feas=delta_feas,
-        lam=lam, kl_actual=kl_actual, k_eff=effective_parents(q),
-        q=q, max_q=float(q.max()) if q.size else 0.0, saturated=saturated,
+        h=h, tau_budget=tau_b, progress_prev=float(np.clip(progress_prev, -1.0, 1.0)),
+        tau_target=tau_target, tau_feasible=tau_feas, relative_ess=relative_ess(q),
+        k_eff=effective_parents(q), kl_actual=kl_to_uniform(q), alpha=alpha,
+        potential_span=span, normalized_potential=normalized,
+        lambda_equivalent=lambda_equivalent, q=q, max_q=float(q.max()),
+        saturated=saturated, k_star=k_star, k_feas=k_feas, m_ties=m_ties,
+        delta_req=float(np.log(n / k_star)),
+        delta_feas=float(np.log(n / k_feas)),
     )

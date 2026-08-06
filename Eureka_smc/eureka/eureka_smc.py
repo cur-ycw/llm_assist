@@ -9,6 +9,7 @@ eureka_reflection proposal、reward-only MH 接受、到达终端桥分布或预
 不改动原 ``eureka.py`` 的 best-of-N 行为。
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -16,16 +17,20 @@ from pathlib import Path
 import hydra
 import numpy as np
 import openai
+from omegaconf import OmegaConf
 
 from utils.extract_task_code import file_to_string
 from utils.create_task import create_task
 
 from smc.actions import ActionConfig
 from smc.evaluator import IsaacGymEvalConfig, IsaacGymEvaluator
+from smc.checkpoint import load_checkpoint, save_checkpoint
 from smc.event_logger import EventLogger
 from smc.island import SMCIsland, SMCIslandConfig
 from smc.proposer import EurekaReflectionProposer, TaskContext
+from smc.run_manifest import write_run_manifest
 from smc.score import ScoreConfig
+from smc.validate_test import check_seed_panels, run_validation_test
 
 EUREKA_ROOT_DIR = os.getcwd()
 
@@ -144,23 +149,67 @@ def main(cfg):
     proposer = EurekaReflectionProposer(ctx, openai, action_prompts=action_prompts,
                                         initial_failed_prompt=prompts["initial_failed_feedback"])
     max_concurrent = algo.evaluation.get("max_concurrent_evals", 6)
+    search_seeds = list(algo.evaluation.search_seed_panel)
+    reeval = algo.get("reevaluation", None)
+    validation_seeds = list(
+        reeval.validation_seed_panel if reeval is not None and reeval.get("enabled", True)
+        else algo.evaluation.validation_seed_panel
+    )
+    test_seeds = list(
+        reeval.test_seed_panel if reeval is not None and reeval.get("enabled", True)
+        else algo.evaluation.test_seed_panel
+    )
+    check_seed_panels(validation_seeds, test_seeds, search_seeds)
+    manifest_budget = {
+        "n_particles": int(algo.n_particles),
+        "init_budget": int(algo.init_budget),
+        "children_per_round": int(algo.children_per_round),
+        "mutation_rounds": int(algo.mutation_rounds),
+        "mutation_budget": int(algo.mutation_budget),
+        "budget_total": int(algo.budget),
+    }
+    write_run_manifest(
+        workspace_dir / "run_manifest.json",
+        resolved_config=OmegaConf.to_container(cfg, resolve=True),
+        task=cfg.env.task,
+        env_name=cfg.env.env_name,
+        search_seeds=search_seeds,
+        validation_seeds=validation_seeds,
+        test_seeds=test_seeds,
+        budget=manifest_budget,
+        checkpoint=dict(algo.get("checkpoint", {})),
+        project_root=Path(__file__).resolve().parents[1],
+    )
     evaluator = IsaacGymEvaluator(
         score_cfg, seeds=list(algo.evaluation.search_seed_panel),
         prompts=prompts, eval_cfg=eval_cfg, cache=algo.evaluation.cache,
         max_concurrent=max_concurrent)
 
+    checkpoint_cfg = algo.get("checkpoint", {})
+    checkpoint_path = Path(checkpoint_cfg.path) if checkpoint_cfg.get("enabled", False) else None
+    resume_from = checkpoint_cfg.get("resume_from", None)
+    resume_state = load_checkpoint(resume_from) if resume_from else None
+    event_start_seq = int(resume_state.get("event_next_seq", 0)) if resume_state else 0
+    event_log = EventLogger(workspace_dir / "smc_events.jsonl", start_seq=event_start_seq)
+
     island = SMCIsland(
         SMCIslandConfig(
             island_id=0, n_particles=algo.n_particles,
-            children_per_round=algo.children_per_round, budget=algo.budget,
-            k_min=algo.k_min, gamma=algo.gamma,
+            children_per_round=algo.children_per_round, mutation_rounds=algo.get("mutation_rounds"),
+            budget=algo.budget, init_budget=algo.get("init_budget"),
+            mutation_budget=algo.get("mutation_budget"),
+            k_min=algo.k_min, gamma=algo.gamma, eta=algo.get("eta", 1.0),
             max_init_repair=algo.max_init_repair, max_same_repair=algo.max_same_repair,
             seed=algo.seed, action_cfg=action_cfg),
         proposer, evaluator,
-        EventLogger(workspace_dir / "smc_events.jsonl"),
+        event_log,
         artifact_root=workspace_dir / "candidates")
 
-    result = island.run()
+    checkpoint_callback = (
+        (lambda state: save_checkpoint(checkpoint_path, state))
+        if checkpoint_path is not None else None
+    )
+    result = island.run(resume_state=resume_state, checkpoint_callback=checkpoint_callback)
     logging.info(f"SMC done: reason={result.termination_reason}, rounds={result.n_rounds}, "
                  f"budget_used={result.budget_used}, last_lambda={result.last_lambda:.4f}, "
                  f"best_score={result.best.search_score if result.best else None}")
@@ -175,24 +224,65 @@ def main(cfg):
     best_code_path.write_text(result.best.reward_code)
     logging.info(f"Best reward code saved to {best_code_path}")
 
-    # ---- held-out 复评（与搜索 panel 不重叠的 seeds，计划 §5.2）----
-    heldout = list(algo.evaluation.heldout_seed_panel)
-    logging.info(f"Held-out re-evaluation on seeds {heldout}")
-    heldout_eval = IsaacGymEvaluator(score_cfg, seeds=heldout, prompts=prompts,
-                                     eval_cfg=eval_cfg, cache=False,
-                                     max_concurrent=max_concurrent)
-    rec = heldout_eval.evaluate(result.best.reward_code, "heldout",
-                                workspace_dir / "heldout")
-    per_seed = rec.reward_components.get("per_seed", [])
-    logging.info(f"Held-out raw search_score (J): mean={rec.search_score}, "
-                 f"per_seed={per_seed}")
-    np.savez(workspace_dir / "smc_summary.npz",
-             termination_reason=result.termination_reason, n_rounds=result.n_rounds,
-             budget_used=result.budget_used, last_lambda=result.last_lambda,
-             best_search_score=result.best.search_score,
-             heldout_search_score=rec.search_score if rec.search_score is not None else np.nan,
-             heldout_per_seed=np.array(per_seed, dtype=float),
-             llm_calls=proposer.n_calls, rl_evals=evaluator.n_evals)
+    # ---- archive → validation → test 三阶段复评（计划 §5 阶段 D）----
+    # archive 汇集所有已完成有效评估的候选（按代码 hash 去重、保留最高原始 J），
+    # 与 island 的 best/population 分离。validation/test seed panel 与 search 及彼此
+    # 均不重叠，成本单独记账、不计入搜索预算 B。
+    reeval = algo.get("reevaluation", None)
+    archive = island.archive
+    logging.info(f"Archive size={len(archive)} (deduped valid candidates)")
+
+    if reeval is not None and reeval.get("enabled", True) and len(archive) > 0:
+        top_k = int(reeval.get("archive_top_k", 3))
+        val_seeds = list(reeval.validation_seed_panel)
+        test_seeds = list(reeval.test_seed_panel)
+        logging.info(f"Reevaluation: top_k={top_k}, validation={val_seeds}, test={test_seeds}")
+        validation_eval = IsaacGymEvaluator(score_cfg, seeds=val_seeds, prompts=prompts,
+                                            eval_cfg=eval_cfg, cache=False,
+                                            max_concurrent=max_concurrent)
+        test_eval = IsaacGymEvaluator(score_cfg, seeds=test_seeds, prompts=prompts,
+                                      eval_cfg=eval_cfg, cache=False,
+                                      max_concurrent=max_concurrent)
+        vt = run_validation_test(
+            archive, validation_eval, test_eval, top_k=top_k,
+            validation_seeds=val_seeds, test_seeds=test_seeds,
+            artifact_root=workspace_dir / "reeval")
+        test_rec = vt.test_record
+        test_per_seed = test_rec.reward_components.get("per_seed", []) if test_rec else []
+        logging.info(f"Validation winner={vt.selected_candidate_id}; "
+                     f"test raw J mean={test_rec.search_score if test_rec else None}, "
+                     f"per_seed={test_per_seed}")
+        (workspace_dir / "validation_test_result.json").write_text(
+            json.dumps(vt.to_json(), default=str, ensure_ascii=False, indent=2))
+        # validation/test 成本单独记账，不并入搜索 evaluator.n_evals
+        np.savez(
+            workspace_dir / "smc_summary.npz",
+            termination_reason=result.termination_reason, n_rounds=result.n_rounds,
+            budget_used=result.budget_used, last_lambda=result.last_lambda,
+            best_search_score=result.best.search_score, archive_size=len(archive),
+            selected_candidate_id=vt.selected_candidate_id or "",
+            test_search_score=test_rec.search_score if (test_rec and test_rec.search_score is not None) else np.nan,
+            test_per_seed=np.array(test_per_seed, dtype=float),
+            llm_calls=proposer.n_calls, rl_evals=evaluator.n_evals,
+            validation_rl_evals=validation_eval.n_evals, test_rl_evals=test_eval.n_evals)
+    else:
+        # 兼容旧路径：单一 best 的 held-out 复评（仅在 reevaluation 关闭时使用）。
+        heldout = list(algo.evaluation.heldout_seed_panel)
+        logging.info(f"Reevaluation disabled; legacy single-best held-out on {heldout}")
+        heldout_eval = IsaacGymEvaluator(score_cfg, seeds=heldout, prompts=prompts,
+                                         eval_cfg=eval_cfg, cache=False,
+                                         max_concurrent=max_concurrent)
+        rec = heldout_eval.evaluate(result.best.reward_code, "heldout",
+                                    workspace_dir / "heldout")
+        per_seed = rec.reward_components.get("per_seed", [])
+        logging.info(f"Held-out raw search_score (J): mean={rec.search_score}, per_seed={per_seed}")
+        np.savez(workspace_dir / "smc_summary.npz",
+                 termination_reason=result.termination_reason, n_rounds=result.n_rounds,
+                 budget_used=result.budget_used, last_lambda=result.last_lambda,
+                 best_search_score=result.best.search_score,
+                 heldout_search_score=rec.search_score if rec.search_score is not None else np.nan,
+                 heldout_per_seed=np.array(per_seed, dtype=float),
+                 llm_calls=proposer.n_calls, rl_evals=evaluator.n_evals)
 
 
 if __name__ == "__main__":

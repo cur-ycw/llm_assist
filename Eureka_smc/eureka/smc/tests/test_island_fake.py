@@ -4,8 +4,7 @@
 multinomial 重采样 / sigmoid 非对称接受 / genealogy / 预算耗尽停止 / RF 五操作路由）在便宜
 替身上的正确性。父代选择/接受用**原始 J**（新方法 §2.2）。
 
-数量约定（Option A）：初始 N 个父代 → 每轮 children_per_round 个子代；init 后种群稳定为
-children_per_round。
+数量约定：初始 N 个父代槽位始终保留；每轮仅修改 M 个经重采样选出的槽位。
 """
 
 from __future__ import annotations
@@ -74,7 +73,41 @@ def test_init_repair_disabled_falls_back(tmp_path):
     assert all(p.valid for p in ps)
 
 
-def test_run_reaches_budget_exhausted(tmp_path):
+def test_explicit_budget_split_requires_consistent_rounds(tmp_path):
+    island, _ = _build(tmp_path, init_budget=8, mutation_budget=8, mutation_rounds=2)
+    assert island.cfg.budget == 16
+    assert island.cfg.init_budget == 8
+    assert island.cfg.mutation_budget == 8
+    assert island.cfg.mutation_rounds == 2
+
+    with pytest.raises(ValueError, match="mutation_budget must equal"):
+        _build(tmp_path / "bad", init_budget=8, mutation_budget=8, mutation_rounds=3)
+
+
+def test_explicit_budget_split_requires_consistent_rounds(tmp_path):
+    island, _ = _build(tmp_path, init_budget=8, mutation_budget=8, mutation_rounds=2)
+    assert island.cfg.budget == 16
+    assert island.cfg.init_budget == 8
+    assert island.cfg.mutation_budget == 8
+    assert island.cfg.mutation_rounds == 2
+
+    with pytest.raises(ValueError, match="mutation_budget must equal"):
+        _build(tmp_path / "bad", init_budget=8, mutation_budget=8, mutation_rounds=3)
+
+
+
+def test_run_stops_when_initialize_does_not_fill_all_slots(tmp_path, monkeypatch):
+    island, _ = _build(tmp_path)
+    partial = [_particle("p0", 0.5)]
+    monkeypatch.setattr(island, "initialize", lambda: partial)
+
+    result = island.run()
+
+    assert result.termination_reason == "insufficient_valid_particles"
+    assert result.budget_used == 0
+    assert result.n_rounds == 0
+
+
     island, _ = _build(tmp_path)
     res = island.run()
     assert res.termination_reason == "budget_exhausted"
@@ -84,14 +117,14 @@ def test_run_reaches_budget_exhausted(tmp_path):
     assert res.best is not None and res.best.search_score is not None
 
 
-def test_population_shrinks_to_children_per_round(tmp_path):
-    # Option A：init 后种群稳定为 children_per_round。resample_counts 长度 = 当轮种群规模。
+def test_population_keeps_n_slots(tmp_path):
+    # N 槽位不变式：每轮只更新被分配资源的槽位，活动 population 始终为 N。
     island, log_path = _build(tmp_path)
     island.run()
     starts = [e for e in _events(log_path) if e["event"] == "stage_start"]
-    assert len(starts[0]["resample_counts"]) == 8   # 第 0 轮父代种群 = 初始 N
-    assert len(starts[1]["resample_counts"]) == 4   # 之后稳定为 children_per_round
-    assert all(len(s["resample_counts"]) == 4 for s in starts[1:])
+    assert len(starts[0]["resample_counts"]) == 8
+    assert all(len(s["resample_counts"]) == 8 for s in starts)
+    assert all(len(e["resample_counts"]) == 8 for e in starts)
 
 
 def test_partial_final_round_spends_remaining_budget(tmp_path):
@@ -115,6 +148,8 @@ def test_first_round_reflects_init_budget_consumption(tmp_path):
     assert first["k_star"] == pytest.approx(5.0, abs=0.1)       # 2 + (8−2)·0.5
     assert first["lam"] > 0.0                                   # 非 λ=0 均匀
     assert first["max_parent_prob"] > 1.0 / 8                   # 已有集中度
+    assert first["potential_definition"] == "raw_search_score"
+    assert first["prior_weight_definition"] == "uniform_slots"
 
 
 def test_concentration_increases_as_budget_drains(tmp_path):
@@ -186,6 +221,83 @@ def test_all_positive_delta_accepts_over_full_run(tmp_path):
     for e in _events(log_path):
         if e["event"] == "accept_decision" and e.get("improved") is True:
             assert e["accepted"] is True
+
+
+def test_valid_rejected_children_stay_in_archive_without_accepted_edge(tmp_path, monkeypatch):
+    island, _ = _build(tmp_path)
+    monkeypatch.setattr(
+        island,
+        "_sigmoid_accept",
+        lambda current, child, alpha, span, stage: current,
+    )
+    island.run()
+
+    tentative = [
+        node for node in island._registry.values()
+        if node.proposal_parent_id is not None
+    ]
+    assert tentative
+    assert all(node.valid for node in tentative)
+    assert all(node.accepted_transition_parent_id is None for node in tentative)
+    archive_ids = {node.id for node in island.archive}
+    assert {node.id for node in tentative} <= archive_ids
+
+
+def test_accepted_child_writes_transition_edge_after_acceptance(tmp_path, monkeypatch):
+    island, _ = _build(tmp_path)
+    monkeypatch.setattr(
+        island,
+        "_sigmoid_accept",
+        lambda current, child, alpha, span, stage: child,
+    )
+    island.run()
+
+    accepted = [
+        node for node in island._registry.values()
+        if node.proposal_parent_id is not None
+    ]
+    assert accepted
+    assert all(node.accepted_transition_parent_id is not None for node in accepted)
+    assert all(node.metadata["state_origin_id"] == node.id for node in accepted)
+
+
+def test_stage_boundary_resume_matches_uninterrupted_run(tmp_path):
+    uninterrupted, _ = _build(tmp_path / "uninterrupted")
+    expected = uninterrupted.run()
+
+    interrupted, _ = _build(tmp_path / "interrupted")
+    snapshots = []
+
+    def stop_after_first_stage(state):
+        snapshots.append(state)
+        if state["phase"] == "stage_end":
+            raise RuntimeError("simulated interruption")
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        interrupted.run(checkpoint_callback=stop_after_first_stage)
+    state = snapshots[-1]
+    assert state["phase"] == "stage_end"
+
+    resumed, resumed_log = _build(tmp_path / "interrupted")
+    actual = resumed.run(resume_state=state)
+
+    assert actual.termination_reason == expected.termination_reason
+    assert actual.budget_used == expected.budget_used
+    assert actual.n_rounds == expected.n_rounds
+    assert actual.best.id == expected.best.id
+    assert actual.best.search_score == pytest.approx(expected.best.search_score)
+    def logical_particle_json(particle: RewardParticle):
+        data = particle.to_json()
+        data.pop("artifact_dir", None)
+        return data
+
+    assert [logical_particle_json(p) for p in resumed.archive] == [
+        logical_particle_json(p) for p in uninterrupted.archive
+    ]
+    assert set(resumed._registry) == set(uninterrupted._registry)
+    assert resumed.ledger.snapshot() == uninterrupted.ledger.snapshot()
+    resumed_events = _events(resumed_log)
+    assert [event["seq"] for event in resumed_events] == list(range(len(resumed_events)))
 
 
 # ---- genealogy / registry ----

@@ -1,16 +1,20 @@
-# 预算条件化 KL–Feynman–Kac 奖励搜索控制器配置（新方法：预算与进展自适应 SMC §2）。
-# 父代选择集中度**只由剩余修改预算决定**：K*_t = k_min + (N-k_min)(b_t/budget)^gamma，
-# 映射为 KL 半径 δ_t=log(N/K*)，一维二分反解选择强度 λ_t 使 KL(softmax(λJ)‖U_N)=δ_t。
-# budget=B_total 含 init 的 N 个初始生成 → init 一建立即扣 N，首个修改轮 b_t/budget=(B_total-N)/B_total<1
-# → 集中度从一开始就非均匀（init 不是边界特例）；预算耗尽→K*→k_min（最集中）。取代旧 ESS 退火桥。
+# 首版冻结：每轮势函数 U_t=当前原始 search_score J_t，先验权重 W_t=Uniform(N)。
+# rESS 控制器在这个均匀先验上重加权；W_t 均匀不等于父代采样分布 q_t 均匀。
+# 当前预算口径固定为 N=16、M=8、R=8、B_total=16+8×8=80，不采用旧的 B=T×N 记号。
+# 父代选择集中度由剩余修改预算和上一轮进展共同决定：控制器反解 λ_t，
+# 使 KL(softmax(λJ)‖U_N) 与本轮目标一致。Batch 2 将其改为无量纲 alpha 坐标。
 
 authority_mode: paper_core   # paper_core | source_compat
 n_islands: 1                 # 首版单岛
-n_particles: 16              # 初始父代种群规模 N（init 生成并修复到 16 个有效种子）
-children_per_round: 8        # 每轮子代数 M（对齐 RF-Agent rf_ratio [2,2,2,1,1]=8；Option A：init 后种群稳定为 8）
-budget: 80                   # 总预算 B_total（含 init 的 N=16 个初始生成；修改次数 = B_total − N = 64）
+n_particles: 16              # N：初始生成 16 个奖励函数，并保持 16 个固定父代槽位
+children_per_round: 8        # M：每个 mutation stage 消耗 8 个修改预算槽位
+init_budget: 16              # 逻辑初始预算 N
+mutation_rounds: 8           # R：固定 8 个 mutation stage
+mutation_budget: 64          # R×M = 8×8
+budget: 80                   # B_total = N + R×M = 16+64
 k_min: 2                     # 有效父代数下界 K_min（预算耗尽时的集中度）
-gamma: 1.0                   # K* 日程曲率（(b/B)^gamma；>1 更晚集中、<1 更早集中）
+gamma: 1.0                   # 旧预算幂日程曲率（兼容/诊断保留；Full 控制器不使用）
+eta: 1.0                     # 延迟进展反馈增益 η（τ_t=τ_budget(h)·exp(-η·h·Γ_{t-1})）
 seed: 0                      # 岛屿 RNG 种子
 max_init_repair: 8           # 初始种子 traceback-repair 最大波数（RF-Agent 式：报错喂回让 LLM 自修复）
 max_same_repair: 3           # 同一种子连修失败多少次后改抽全新（RF-Agent max_same_try_cnt）
@@ -48,6 +52,21 @@ score:
 # 本身而非 seed 运气。仅最后对最优/top-k 用 heldout 多 seed 复评。
 evaluation:
   search_seed_panel: [42]                          # 单 seed 搜索(固定 CRN)，与 Eureka 一致
-  heldout_seed_panel: [100, 101, 102, 103, 104]    # 最后复评，与搜索 seed 完全不重叠
+  heldout_seed_panel: [100, 101, 102, 103, 104]    # 旧单-best 复评（兼容保留；Full 用下方 reevaluation）
   cache: true
   max_concurrent_evals: 6                           # 每波并发 train.py 上限（3×3090 下 6≈每卡 2 个，给显存留余量）
+
+# Stage-boundary runtime checkpoint. `resume_from` must point to a checkpoint
+# produced by the same resolved SMC configuration.
+checkpoint:
+  enabled: false
+  path: smc_runtime_checkpoint.json
+  resume_from: null
+
+# archive top-k → validation → test 三阶段复评（计划 §5 阶段 D）。
+# validation/test 与 search seed 完全不重叠，且彼此不重叠；成本单独记账，不计入 B。
+reevaluation:
+  enabled: true
+  archive_top_k: 3                                  # 从 archive 取 top-k 进入 validation
+  validation_seed_panel: [200, 201, 202]            # 稳定选唯一候选
+  test_seed_panel: [300, 301, 302, 303, 304]        # 仅对 validation 冠军做 test

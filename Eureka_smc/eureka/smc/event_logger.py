@@ -15,12 +15,27 @@ __all__ = ["EventLogger"]
 
 
 class EventLogger:
-    def __init__(self, path: str | Path, clock: bool = True):
+    def __init__(self, path: str | Path, clock: bool = True, start_seq: int = 0):
+        if start_seq < 0:
+            raise ValueError("start_seq must be non-negative")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.path, "a", buffering=1)  # 行缓冲
-        self._seq = 0
+        self._seq = int(start_seq)
         self._clock = clock
+
+    @property
+    def next_seq(self) -> int:
+        """Sequence that will be assigned to the next event."""
+        return self._seq
+
+    def restore_next_seq(self, next_seq: int) -> None:
+        if next_seq < 0:
+            raise ValueError("next_seq must be non-negative")
+        self._seq = int(next_seq)
+
+    def flush(self) -> None:
+        self._fh.flush()
 
     def log(self, event: str, **fields: Any) -> None:
         rec: dict[str, Any] = {"seq": self._seq, "event": event}

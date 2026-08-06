@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 
 @dataclass
@@ -48,6 +48,14 @@ class EvalRecord:
         d["tensorboard_dirs"] = list(self.tensorboard_dirs)
         d["stdout_paths"] = list(self.stdout_paths)
         return d
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> "EvalRecord":
+        value = dict(data)
+        for key in ("train_seeds", "tensorboard_dirs", "stdout_paths"):
+            if key in value and value[key] is not None:
+                value[key] = tuple(value[key])
+        return cls(**value)
 
 
 @dataclass
@@ -94,3 +102,26 @@ class RewardParticle:
             "eval": self.eval.to_json(),
             "metadata": self.metadata,
         }
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> "RewardParticle":
+        value = dict(data)
+        eval_data = dict(value.pop("eval", {}) or {})
+        if not eval_data:
+            eval_data = {
+                key: value.pop(key)
+                for key in (
+                    "search_score", "valid", "executable", "feedback", "raw_metrics",
+                    "reward_components", "error", "train_seeds", "tensorboard_dirs",
+                    "stdout_paths", "env_code_path", "wall_time_s", "cache_key", "metadata",
+                )
+                if key in value
+            }
+        value.pop("search_score", None)
+        value.pop("valid", None)
+        artifact_dir = value.get("artifact_dir")
+        if artifact_dir is not None:
+            value["artifact_dir"] = Path(artifact_dir)
+        value["metadata"] = dict(value.get("metadata") or {})
+        value["eval"] = EvalRecord.from_json(eval_data)
+        return cls(**value)

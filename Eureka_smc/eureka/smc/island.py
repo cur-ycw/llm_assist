@@ -8,9 +8,9 @@
   → 循环修改轮，直到剩余预算 b_t 耗尽（budget_exhausted）：
         1. 由**剩余预算** b_t 解算目标有效父代数 K*_t、KL 半径 δ_t、选择强度 λ_t 与父代分布
            q_t = softmax(λ_t·J)（kl_controller.resolve；J 为**原始**任务性能，不归一化）
-        2. 抽 M_t = min(children_per_round, b_t) 个父代副本 A^j ~ Categorical(q_t)（multinomial）→ clone
+        2. 从 N 个父代槽位抽取 M_t 个待修改 slot（multinomial，可重复）→ clone
         3. 每个副本一次 LLM 修改（RF 五操作路由）+ 评估 + **sigmoid 非对称接受**：改进确定进入，
-           非改进以 σ(λ_t·Δ) 概率进入；拒绝则保留父代代码
+           非改进以 σ(λ_t·Δ) 概率进入；拒绝则保留对应槽位的父代代码
         4. b_t -= M_t（每次 LLM 修改调用都计预算，含无效候选，§7.2）
   → 返回与粒子群分离保存的 best_so_far（按原始 J）及终止原因。
 
@@ -26,19 +26,23 @@ provenance（不变量）：
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
-from . import kl_controller
+from . import kl_controller, progress
 from .actions import ActionConfig, assign_actions
+from .archive import CandidateArchive
 from .contracts import check_mutation_parameter, check_mutation_structure
 from .context import format_crossover, format_different, format_path
 from .event_logger import EventLogger
+from .ledger import BudgetLedger
 from .particle import EvalRecord, RewardParticle
 from .resampling import multinomial_resample
 
@@ -50,15 +54,62 @@ __all__ = ["SMCIslandConfig", "SMCIsland", "IslandResult"]
 @dataclass
 class SMCIslandConfig:
     island_id: int = 0
-    n_particles: int = 16           # 初始父代种群规模 N（init 生成并修复到这么多有效种子）
-    children_per_round: int = 8     # 每轮子代数 M（=重采样-变异次数；Option A：init 后种群稳定为此值）
-    budget: int = 80               # 总预算 B_total（含 init 的 N；集中度分母；修改次数 = B_total − N）
+    n_particles: int = 16           # 初始化生成并保持的父代槽位数 N
+    children_per_round: int = 8     # 每轮修改子代数 M；Isaac Gym 标准为 8
+    mutation_rounds: Optional[int] = None # init 后修改轮数；None 时由修改预算推导
+    budget: int = 80                 # 兼容字段：总逻辑候选预算 = init_budget + mutation_budget
+    init_budget: Optional[int] = None     # 初始生成逻辑预算；默认等于 N
+    mutation_budget: Optional[int] = None # 后续修改逻辑预算；默认等于 rounds×M
     k_min: int = 2                 # 有效父代数下界 K_min（预算耗尽时的集中度）
-    gamma: float = 1.0             # K*_t = K_min + (N-K_min)(b_t/B_total)^gamma 的曲率
+    gamma: float = 1.0             # 兼容保留（旧预算幂日程曲率；Full 控制器忽略，仅诊断用）
+    eta: float = 1.0               # 进展延迟反馈增益：τ_t = τ_budget(h)·exp(-η·h·Γ_{t-1})
     max_init_repair: int = 8        # 初始种子 traceback-repair 的最大波数（RF-Agent 式，≈其 max_try_num=9）
     max_same_repair: int = 3        # 同一种子连续修复失败多少次后丢弃、改抽全新（RF-Agent max_same_try_cnt）
     seed: int = 0
     action_cfg: Optional[ActionConfig] = None  # 五操作路由（None/generic=单一 eureka_reflection）
+
+    def __post_init__(self) -> None:
+        """校验初始化池、每轮修改资源和总候选预算的关系。"""
+        if self.n_particles <= 0:
+            raise ValueError("n_particles must be positive")
+        if self.children_per_round <= 0:
+            raise ValueError("children_per_round must be positive")
+        init_budget = self.n_particles if self.init_budget is None else int(self.init_budget)
+        if init_budget != self.n_particles:
+            raise ValueError("init_budget must equal n_particles")
+        explicit_rounds = self.mutation_rounds is not None
+        explicit_mutation_budget = self.mutation_budget is not None
+        if explicit_rounds and self.mutation_rounds < 0:
+            raise ValueError("mutation_rounds must be non-negative")
+        if explicit_mutation_budget and self.mutation_budget < 0:
+            raise ValueError("mutation_budget must be non-negative")
+        if explicit_rounds and explicit_mutation_budget:
+            if self.mutation_budget != self.mutation_rounds * self.children_per_round:
+                raise ValueError(
+                    "mutation_budget must equal mutation_rounds * children_per_round"
+                )
+        elif explicit_rounds:
+            self.mutation_budget = self.mutation_rounds * self.children_per_round
+        elif explicit_mutation_budget:
+            self.mutation_rounds = math.ceil(
+                self.mutation_budget / self.children_per_round
+            ) if self.mutation_budget else 0
+        else:
+            mutation_budget = self.budget - init_budget
+            if mutation_budget < 0:
+                raise ValueError("budget must cover the initial particle batch")
+            self.mutation_budget = mutation_budget
+            self.mutation_rounds = math.ceil(
+                mutation_budget / self.children_per_round
+            ) if mutation_budget else 0
+        self.init_budget = init_budget
+        expected_budget = self.init_budget + self.mutation_budget
+        if self.budget != expected_budget:
+            raise ValueError("budget must equal init_budget + mutation_budget")
+        if self.k_min < 1 or self.k_min > self.n_particles:
+            raise ValueError("k_min must lie in [1, n_particles]")
+        if self.eta < 0 or not np.isfinite(self.eta):
+            raise ValueError("eta must be finite and non-negative")
 
 
 @dataclass
@@ -67,7 +118,8 @@ class IslandResult:
     termination_reason: str         # budget_exhausted | insufficient_valid_particles
     n_rounds: int
     budget_used: int                # 已消耗的总预算（init N + LLM 修改调用），应等于 B_total
-    last_lambda: float              # 最后一轮的选择强度 λ_t（诊断）
+    last_lambda: float              # 派生诊断 λ_equivalent=alpha/span（兼容字段）
+    last_alpha: float = 0.0         # 最后一轮的无量纲选择强度 alpha_t
 
 
 class SMCIsland:
@@ -81,7 +133,9 @@ class SMCIsland:
         self.artifact_root = Path(artifact_root) if artifact_root else Path("candidates")
         self.rng = np.random.default_rng(config.seed)
         self._id_counter = 0
-        self.best: Optional[RewardParticle] = None  # 与粒子群分离保存的历史最优
+        self.best: Optional[RewardParticle] = None  # all valid evaluated candidates' search-best
+        self.archive = CandidateArchive()
+        self.ledger = BudgetLedger()
         # RF-Agent 历史型 action（crossover/path/different）的料源：注册每个**被评估过**的
         # 粒子（id→粒子），供体/谱系/异谱系意图都从这里确定性选出。generic/变异路径不读它，
         # 只写不读，故不影响 Phase-2/3a 行为与 rng 消费。
@@ -89,6 +143,94 @@ class SMCIsland:
         ac = config.action_cfg
         self._crossover_k = getattr(ac, "crossover_k", 2) if ac is not None else 2
         self._history_k = getattr(ac, "history_k", 4) if ac is not None else 4
+
+    def _config_fingerprint(self) -> str:
+        payload = asdict(self.cfg)
+        payload["action_cfg"] = asdict(self.cfg.action_cfg) if self.cfg.action_cfg else None
+        encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _component_runtime_state(component: Any) -> dict[str, Any]:
+        state = {
+            name: int(getattr(component, name))
+            for name in ("n_calls", "total_prompt_tokens", "total_completion_tokens", "n_evals")
+            if hasattr(component, name)
+        }
+        rng = getattr(component, "rng", None)
+        if isinstance(rng, np.random.Generator):
+            state["rng_state"] = rng.bit_generator.state
+        return state
+
+    @staticmethod
+    def _restore_component_runtime_state(component: Any, state: dict[str, Any]) -> None:
+        for name in ("n_calls", "total_prompt_tokens", "total_completion_tokens", "n_evals"):
+            if name in state and hasattr(component, name):
+                setattr(component, name, int(state[name]))
+        rng = getattr(component, "rng", None)
+        if "rng_state" in state and isinstance(rng, np.random.Generator):
+            rng.bit_generator.state = state["rng_state"]
+
+    def snapshot_runtime(self, *, phase: str, population: list[RewardParticle],
+                         budget_remaining: int, round_idx: int,
+                         progress_prev: float, last_alpha: float,
+                         last_lambda: float) -> dict[str, Any]:
+        """Return a stage-boundary-only JSON state for deterministic resume."""
+        self.log.flush()
+        return {
+            "schema_version": 1,
+            "phase": phase,
+            "config_fingerprint": self._config_fingerprint(),
+            "population": [p.to_json() for p in population],
+            "best_id": self.best.id if self.best else None,
+            "registry": [p.to_json() for p in self._registry.values()],
+            "archive": self.archive.snapshot(),
+            "ledger": self.ledger.snapshot(),
+            "budget_remaining": int(budget_remaining),
+            "round_idx": int(round_idx),
+            "progress_prev": float(progress_prev),
+            "last_alpha": float(last_alpha),
+            "last_lambda": float(last_lambda),
+            "id_counter": int(self._id_counter),
+            "rng_state": self.rng.bit_generator.state,
+            "proposer_runtime": self._component_runtime_state(self.proposer),
+            "evaluator_runtime": self._component_runtime_state(self.evaluator),
+            "event_next_seq": self.log.next_seq,
+        }
+
+    def restore_runtime(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Restore a stage-boundary snapshot after validating its method contract."""
+        if state.get("schema_version") != 1:
+            raise ValueError("unsupported island runtime checkpoint schema")
+        if state.get("config_fingerprint") != self._config_fingerprint():
+            raise ValueError("checkpoint configuration fingerprint does not match")
+        population = [RewardParticle.from_json(item) for item in state["population"]]
+        if len(population) != self.cfg.n_particles:
+            raise ValueError("checkpoint population does not match n_particles")
+        registry = [RewardParticle.from_json(item) for item in state["registry"]]
+        self._registry = {p.id: p for p in registry}
+        if len(self._registry) != len(registry):
+            raise ValueError("checkpoint registry contains duplicate particle IDs")
+        self.archive = CandidateArchive.from_snapshot(state["archive"])
+        self.ledger = BudgetLedger.from_snapshot(state["ledger"])
+        best_id = state.get("best_id")
+        self.best = self._registry.get(best_id) if best_id else None
+        if best_id and self.best is None:
+            raise ValueError("checkpoint best_id is absent from registry")
+        self._id_counter = int(state["id_counter"])
+        self.rng.bit_generator.state = state["rng_state"]
+        self._restore_component_runtime_state(self.proposer, state.get("proposer_runtime", {}))
+        self._restore_component_runtime_state(self.evaluator, state.get("evaluator_runtime", {}))
+        return {
+            "phase": state["phase"],
+            "population": population,
+            "budget_remaining": int(state["budget_remaining"]),
+            "round_idx": int(state["round_idx"]),
+            "progress_prev": float(state["progress_prev"]),
+            "last_alpha": float(state["last_alpha"]),
+            "last_lambda": float(state["last_lambda"]),
+            "event_next_seq": int(state["event_next_seq"]),
+        }
 
     # ---- 工具 ----
     def _next_id(self) -> str:
@@ -252,9 +394,12 @@ class SMCIsland:
                          accepted_transition_parent_id=s.get("accepted_transition_parent_id"),
                          clone_ancestor_id=s.get("clone_ancestor_id"),
                          proposal_action=s.get("proposal_action"))
+            self._registry[p.id] = p  # 全部已评估节点，供谱系审计与历史型 action 使用。
+            self.archive.add(p)        # 所有 valid/finite 候选（含后续被拒子代）进入选择 archive。
             self._consider_best(p)
-            self._registry[p.id] = p  # 登记料源（历史型 action 用；只写不读默认路径）
             particles.append(p)
+        self.ledger.record_evaluations(particles)
+        self.ledger.sync_actual_costs(self.proposer, self.evaluator)
         return particles
 
     # ---- 初始化（计划 §6.1 + RF-Agent 初始 traceback-repair）----
@@ -323,8 +468,9 @@ class SMCIsland:
         cum = np.cumsum(x)
         return float((n + 1 - 2.0 * cum.sum() / cum[-1]) / n)
 
-    def _round(self, particles: list[RewardParticle], b_t: int,
-               round_idx: int) -> tuple[list[RewardParticle], "kl_controller.ControllerStep", int]:
+    def _round(self, particles: list[RewardParticle], b_t: int, round_idx: int,
+               progress_prev: float = 0.0
+               ) -> tuple[list[RewardParticle], "kl_controller.ControllerStep", int, float]:
         n = len(particles)
         # 原始 J（population 均为 valid；None 兜底为当轮有限最小值，控制器要求有限输入）
         raw = [p.search_score for p in particles]
@@ -332,18 +478,34 @@ class SMCIsland:
         floor = min(finite) if finite else 0.0
         J = np.array([x if x is not None else floor for x in raw], dtype=np.float64)
 
+        # 首版冻结：势函数仅为原始任务搜索分数，所有固定槽位具有相等先验权重。
+        # q 仍由 rESS 控制器根据 J 形成，uniform W 不等于均匀父代抽样。
+        U_t = J
+        W_t = np.full(n, 1.0 / float(n), dtype=np.float64)
+        # 预算给出基础 τ；上一轮进展 Γ_{t-1} 经延迟反馈修正本轮目标（Full 控制器 §2.3）。
         step = kl_controller.resolve(J, float(b_t), float(self.cfg.budget), n,
-                                     float(self.cfg.k_min), float(self.cfg.gamma))
-        m_t = min(self.cfg.children_per_round, int(b_t))   # 每轮子代数 M（Option A：种群随之稳定为 M）
+                                     float(self.cfg.k_min),
+                                     eta=float(self.cfg.eta),
+                                     progress_prev=float(progress_prev),
+                                     U=U_t, weights=W_t)
+        m_t = min(self.cfg.children_per_round, int(b_t))   # 最后一轮允许不足 M，正常情况下固定为 M
         idx = multinomial_resample(step.q, m_t, self.rng)
 
         counts = np.bincount(idx, minlength=n)
         self.log.log(
             "stage_start", stage=round_idx, budget_remaining=int(b_t),
             budget_frac=float(b_t) / float(self.cfg.budget), m_t=m_t,
+            eta=float(self.cfg.eta), progress_prev=step.progress_prev,
+            tau_budget=step.tau_budget, tau_target=step.tau_target,
+            tau_feasible=step.tau_feasible, relative_ess=step.relative_ess,
             k_star=step.k_star, k_feas=step.k_feas, m_ties=step.m_ties,
             kl_requested=step.delta_req, kl_feasible=step.delta_feas,
             kl_actual=step.kl_actual, lam=step.lam, k_eff=step.k_eff,
+            alpha=step.alpha, potential_span=step.potential_span,
+            normalized_potential_min=float(step.normalized_potential.min()),
+            normalized_potential_max=float(step.normalized_potential.max()),
+            lambda_equivalent=step.lambda_equivalent,
+            potential_definition="raw_search_score", prior_weight_definition="uniform_slots",
             max_parent_prob=step.max_q, kl_saturated=step.saturated,
             unique_parents=int(np.count_nonzero(counts)),
             resample_counts=counts.tolist(), alloc_gini=self._gini(counts),
@@ -353,7 +515,7 @@ class SMCIsland:
             ancestors=idx.tolist(),
         )
 
-        # clone 重采样父代 → 本轮活动集（clone 不重新评估，复制父的 eval）
+        # clone 重采样父代仅作为每个修改 slot 的 proposal 上下文；接受后写回原始 N 槽位。
         current: list[RewardParticle] = []
         for a in idx:
             parent = particles[int(a)]
@@ -375,67 +537,172 @@ class SMCIsland:
         for i, (c, (child_code, action, thought)) in enumerate(zip(current, proposals)):
             if child_code is None or child_code == c.reward_code:
                 self.log.log("proposal_noop", id=c.id, stage=round_idx, action=action)
+                self.ledger.record_noop()
                 continue
             specs.append(dict(
                 code=child_code, generation=c.generation, proposal_parent_id=c.id,
-                accepted_transition_parent_id=c.metadata.get("state_origin_id", c.id),
                 clone_ancestor_id=None, proposal_action=action, design_thought=thought,
                 parent_code=c.reward_code))
             slots.append(i)
         children = self._make_particles_batch(specs)
+        # Y_t：本轮**原始**子代分数（接受前，用于进展度量；无效子代按当轮 floor 兜底）。
+        child_scores = [c.search_score if (c.valid and c.search_score is not None) else floor
+                        for c in children]
+        # N 槽位不变式：每个资源 slot 仍回写到其被抽中的原始父代槽位；
+        # 同一父代被抽中多次时，按 proposal 顺序处理，最后一个被接受的 child 留在该槽位。
+        next_population = list(particles)
         for child, i in zip(children, slots):
-            current[i] = self._sigmoid_accept(current[i], child, step.lam, round_idx)
-        return current, step, m_t
+            accepted = self._sigmoid_accept(current[i], child, step.alpha,
+                                            step.potential_span, round_idx)
+            self.ledger.record_acceptance(accepted is child)
+            if accepted is child:
+                child.accepted_transition_parent_id = current[i].metadata.get(
+                    "state_origin_id", current[i].id
+                )
+                child.metadata["state_origin_id"] = child.id
+                next_population[int(idx[i])] = child
+
+        # Γ_t: retain repeated resampling indices because each occurrence received
+        # an independent LLM-modification resource in this stage.
+        resource_parent_indices = idx.tolist()
+        if child_scores and resource_parent_indices:
+            pstep = progress.compute_progress(step.q, J, child_scores,
+                                              parent_indices=resource_parent_indices)
+            gamma_t = pstep.gamma
+            self.log.log("progress", stage=round_idx, k_eff=pstep.k_eff, k=pstep.k,
+                         auc=pstep.auc, gamma=gamma_t, n_children=len(child_scores),
+                         n_resource_slots=len(resource_parent_indices),
+                         n_unique_resource_parents=int(np.count_nonzero(counts)))
+        else:
+            gamma_t = 0.0  # 无子代（全 noop）→ 无进展信号，下一轮退回纯预算目标
+            self.log.log("progress", stage=round_idx, gamma=gamma_t,
+                         n_children=len(child_scores), n_resource_slots=len(resource_parent_indices),
+                         n_unique_resource_parents=int(np.count_nonzero(counts)))
+        return next_population, step, m_t, gamma_t
 
     def _sigmoid_accept(self, current: RewardParticle, child: RewardParticle,
-                        lam_t: float, round_idx: int) -> RewardParticle:
-        """非对称 sigmoid 接受（新方法 §2.6）：Δ>0 确定进入；Δ≤0 以 σ(λ_t·Δ) 概率进入。"""
+                        alpha_t: float, potential_span: float = 1.0,
+                        round_idx: Optional[int] = None) -> RewardParticle:
+        """Use the dimensionless acceptance coordinate ``alpha * delta / span``.
+
+        The four-argument form is retained for existing callers: its final
+        positional value is the stage index and uses the historical unit span.
+        The mutation path always supplies the explicit span and stage.
+        """
+        if round_idx is None:
+            round_idx = int(potential_span)
+            potential_span = 1.0
         if not child.valid or child.search_score is None:
             self.log.log("accept_decision", parent=current.id, child=child.id, stage=round_idx,
                          accepted=False, reason="invalid_child")
             return current
         delta = child.search_score - (current.search_score or 0.0)
         improved = delta > 0.0
+        normalized_delta = delta / potential_span if potential_span > 0.0 else 0.0
         if improved:
             accept = True
             p_accept = 1.0
+        elif potential_span == 0.0:
+            p_accept = 0.5
+            accept = self.rng.random() < p_accept
         else:
-            p_accept = float(1.0 / (1.0 + np.exp(-lam_t * delta)))  # σ(λ_t·Δ), Δ≤0 → ≤0.5
+            z = float(alpha_t * normalized_delta)
+            # Stable sigmoid; the non-improvement branch has z <= 0.
+            p_accept = float(np.exp(z) / (1.0 + np.exp(z))) if z >= -40.0 else 0.0
             accept = self.rng.random() < p_accept
         self.log.log("accept_decision", parent=current.id, child=child.id, stage=round_idx,
-                     delta=delta, lam=lam_t, p_accept=p_accept, improved=improved,
-                     accepted=accept)
+                     delta=delta, normalized_delta=normalized_delta, alpha=alpha_t,
+                     potential_span=potential_span,
+                     lambda_equivalent=(alpha_t / potential_span if potential_span > 0.0 else 0.0),
+                     p_accept=p_accept, improved=improved, accepted=accept)
         return child if accept else current
 
     # ---- 主循环（新方法 §2.5：预算耗尽即停）----
-    def run(self) -> IslandResult:
-        particles = self.initialize()
-        if len(particles) < 1:
-            return IslandResult(self.best, "insufficient_valid_particles", 0, 0, 0.0)
+    def run(
+        self,
+        *,
+        resume_state: Optional[dict[str, Any]] = None,
+        checkpoint_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> IslandResult:
+        """Run from a fresh init or a completed-stage runtime snapshot.
 
-        # 预算记账：总预算 B_total 含 init 的 N 个初始生成 → init 一建立就扣掉 N，
-        # 故首个修改轮的剩余预算已是 B_total − N（首轮集中度非均匀，用户明示 init 在预算内）。
+        ``checkpoint_callback`` is invoked only after init, a completed stage,
+        and terminal completion. It must persist the supplied JSON state before
+        returning or raise; no batch-in-flight state is checkpointed.
+        """
+        if resume_state is None:
+            particles = self.initialize()
+            if len(particles) != int(self.cfg.n_particles):
+                return IslandResult(self.best, "insufficient_valid_particles", 0, 0, 0.0)
+
+            # 预算记账：总预算 B_total 含 init 的 N 个初始生成 → init 一建立就扣掉 N，
+            # 故首个修改轮的剩余预算已是 B_total − N（首轮集中度非均匀，用户明示 init 在预算内）。
+            b_total = int(self.cfg.budget)
+            b_t = int(self.cfg.mutation_budget)
+            self.ledger.logical_init_slots = int(self.cfg.init_budget)
+            self.ledger.sync_actual_costs(self.proposer, self.evaluator)
+            self.log.log("init_budget_spent", n_init=int(self.cfg.n_particles),
+                         init_budget=int(self.cfg.init_budget), mutation_budget=b_t,
+                         budget_total=b_total, budget_remaining=b_t,
+                         ledger=self.ledger.snapshot())
+            round_idx = 0
+            last_lambda = 0.0
+            last_alpha = 0.0
+            progress_prev = 0.0             # 首轮无历史进展 → 纯预算目标（Γ_0 = 0，计划 §2.3）
+            if checkpoint_callback is not None:
+                checkpoint_callback(self.snapshot_runtime(
+                    phase="initialized", population=particles, budget_remaining=b_t,
+                    round_idx=round_idx, progress_prev=progress_prev,
+                    last_alpha=last_alpha, last_lambda=last_lambda,
+                ))
+        else:
+            restored = self.restore_runtime(resume_state)
+            if restored["phase"] not in {"initialized", "stage_end"}:
+                raise ValueError("checkpoint phase is not resumable")
+            particles = restored["population"]
+            b_t = restored["budget_remaining"]
+            round_idx = restored["round_idx"]
+            progress_prev = restored["progress_prev"]
+            last_alpha = restored["last_alpha"]
+            last_lambda = restored["last_lambda"]
+            self.log.restore_next_seq(restored["event_next_seq"])
+
         b_total = int(self.cfg.budget)
-        b_t = b_total - int(self.cfg.n_particles)
-        self.log.log("init_budget_spent", n_init=int(self.cfg.n_particles),
-                     budget_total=b_total, budget_remaining=b_t)
-        round_idx = 0
-        last_lambda = 0.0
-        # 修改预算 = B_total − N，每轮花 min(children_per_round, b_t) → 至多 ceil((B_total−N)/M) 轮；+1 兜底
-        mutation_budget = max(0, b_total - int(self.cfg.n_particles))
-        max_rounds = math.ceil(mutation_budget / max(1, self.cfg.children_per_round)) + 1
+        # 修改批次由显式 mutation_rounds 定义；budget 校验保证每个标准轮都有 children_per_round 个 slot。
+        max_rounds = int(self.cfg.mutation_rounds)
         while b_t > 0 and round_idx < max_rounds:
-            particles, step, m_t = self._round(particles, b_t, round_idx)
+            particles, step, m_t, progress_prev = self._round(
+                particles, b_t, round_idx, progress_prev)   # Γ 延迟一轮：本轮 Γ_t 喂下一轮
             b_t -= m_t                      # 每次 LLM 修改调用计预算（含无效候选，§7.2）
-            last_lambda = step.lam
+            self.ledger.record_mutation_slots(m_t)
+            self.ledger.sync_actual_costs(self.proposer, self.evaluator)
+            last_lambda = step.lambda_equivalent
+            last_alpha = step.alpha
             round_idx += 1
             self.log.log("stage_end", stage=round_idx, budget_remaining=b_t,
+                         ledger=self.ledger.snapshot(),
                          best_score=self.best.search_score if self.best else None,
+                         last_alpha=last_alpha, last_lambda=last_lambda,
                          unique_lineages=len({p.metadata.get("state_origin_id") for p in particles}))
+            if checkpoint_callback is not None:
+                checkpoint_callback(self.snapshot_runtime(
+                    phase="stage_end", population=particles, budget_remaining=b_t,
+                    round_idx=round_idx, progress_prev=progress_prev,
+                    last_alpha=last_alpha, last_lambda=last_lambda,
+                ))
 
-        budget_used = b_total - max(0, b_t)   # init N + 已花修改次数（应 = B_total）
+        budget_used = int(self.cfg.init_budget) + (int(self.cfg.mutation_budget) - max(0, b_t))
+        self.ledger.sync_actual_costs(self.proposer, self.evaluator)
         self.log.log("island_done", termination_reason="budget_exhausted", n_rounds=round_idx,
-                     budget_used=budget_used, last_lambda=last_lambda,
+                     budget_used=budget_used, ledger=self.ledger.snapshot(),
+                     last_lambda=last_lambda,
                      best_id=self.best.id if self.best else None,
                      best_score=self.best.search_score if self.best else None)
-        return IslandResult(self.best, "budget_exhausted", round_idx, budget_used, last_lambda)
+        terminal_state = self.snapshot_runtime(
+            phase="completed", population=particles, budget_remaining=b_t,
+            round_idx=round_idx, progress_prev=progress_prev,
+            last_alpha=last_alpha, last_lambda=last_lambda,
+        )
+        if checkpoint_callback is not None:
+            checkpoint_callback(terminal_state)
+        return IslandResult(self.best, "budget_exhausted", round_idx, budget_used, last_lambda, last_alpha)
