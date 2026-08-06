@@ -1,3 +1,6 @@
+# env 只选择任务；algo=smc 选择 Isaac Gym 环境族统一预算协议（B=80）。
+# Bi-DexHands 专用入口选择 algo=smc_bidex，即同一协议的 bidex 环境族（B=512）。
+# 单任务 launcher 不覆盖 init/mutation/total budget 拆分。
 defaults:
   - _self_
   - env: cartpole          # Batch-2 bring-up 任务

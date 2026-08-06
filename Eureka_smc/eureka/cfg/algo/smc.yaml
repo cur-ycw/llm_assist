@@ -1,18 +1,42 @@
+# Isaac Gym / Bi-DexHands 环境族统一 SMC 预算协议。
+# 任务只选择环境族；预算由本协议派生，单个任务 launcher 不得覆盖拆分。
+#
 # 首版冻结：每轮势函数 U_t=当前原始 search_score J_t，先验权重 W_t=Uniform(N)。
 # rESS 控制器在这个均匀先验上重加权；W_t 均匀不等于父代采样分布 q_t 均匀。
-# 当前预算口径固定为 N=16、M=8、R=8、B_total=16+8×8=80，不采用旧的 B=T×N 记号。
-# 父代选择集中度由剩余修改预算和上一轮进展共同决定：控制器反解 λ_t，
-# 使 KL(softmax(λJ)‖U_N) 与本轮目标一致。Batch 2 将其改为无量纲 alpha 坐标。
+# Isaac Gym: B=16+8×8=80；Bi-DexHands: B=64+7×64=512。
+# 每个环境族的初始化批次和 mutation stage 都按其 children/population 配置完整并行。
+# 物理 GPU 排布沿用原 Eureka set_freest_gpu，不属于 SMC 预算协议。
+
+environment_family: isaac_gym
+
+budget_protocols:
+  isaac_gym:
+    n_particles: 16
+    init_budget: 16
+    children_per_round: 8
+    mutation_rounds: 8
+    mutation_budget: 64
+    budget: 80
+    k_min: 2
+  bidex:
+    n_particles: 64
+    init_budget: 64
+    children_per_round: 64
+    mutation_rounds: 7
+    mutation_budget: 448
+    budget: 512
+    k_min: 8
+
+n_particles: ${budget_protocols.${environment_family}.n_particles}
+children_per_round: ${budget_protocols.${environment_family}.children_per_round}
+init_budget: ${budget_protocols.${environment_family}.init_budget}
+mutation_rounds: ${budget_protocols.${environment_family}.mutation_rounds}
+mutation_budget: ${budget_protocols.${environment_family}.mutation_budget}
+budget: ${budget_protocols.${environment_family}.budget}
+k_min: ${budget_protocols.${environment_family}.k_min}
 
 authority_mode: paper_core   # paper_core | source_compat
 n_islands: 1                 # 首版单岛
-n_particles: 16              # N：初始生成 16 个奖励函数，并保持 16 个固定父代槽位
-children_per_round: 8        # M：每个 mutation stage 消耗 8 个修改预算槽位
-init_budget: 16              # 逻辑初始预算 N
-mutation_rounds: 8           # R：固定 8 个 mutation stage
-mutation_budget: 64          # R×M = 8×8
-budget: 80                   # B_total = N + R×M = 16+64
-k_min: 2                     # 有效父代数下界 K_min（预算耗尽时的集中度）
 gamma: 1.0                   # 旧预算幂日程曲率（兼容/诊断保留；Full 控制器不使用）
 eta: 1.0                     # 延迟进展反馈增益 η（τ_t=τ_budget(h)·exp(-η·h·Γ_{t-1})）
 seed: 0                      # 岛屿 RNG 种子
@@ -54,7 +78,8 @@ evaluation:
   search_seed_panel: [42]                          # 单 seed 搜索(固定 CRN)，与 Eureka 一致
   heldout_seed_panel: [100, 101, 102, 103, 104]    # 旧单-best 复评（兼容保留；Full 用下方 reevaluation）
   cache: true
-  max_concurrent_evals: 6                           # 每波并发 train.py 上限（3×3090 下 6≈每卡 2 个，给显存留余量）
+  # 上限由环境族 population 槽位派生；init 和 mutation 均在容量允许时整批启动。
+  max_concurrent_evals: ${n_particles}
   startup_timeout_seconds: 600                      # 等待训练 import reward 源码的上限；超时会清理子进程
   training_timeout_seconds: 7200                    # 单个 train.py 训练上限；超时会清理子进程
   lock_timeout_seconds: 300                          # 获取跨进程共享 task 注入锁的上限

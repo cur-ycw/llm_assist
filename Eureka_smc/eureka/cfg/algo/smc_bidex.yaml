@@ -1,0 +1,7 @@
+# SMC-Eureka 环境族预算协议的兼容别名。
+# 实际协议集中在 smc.yaml 的 budget_protocols.bidex；此文件供未来 Bi-Dex 专用入口
+# 通过 algo=smc_bidex 选择，并保持同一份预算定义。
+_defaults:
+  - smc
+
+environment_family: bidex

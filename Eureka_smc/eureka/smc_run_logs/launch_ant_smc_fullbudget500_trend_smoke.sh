@@ -63,27 +63,15 @@ export EUREKA_KEY_INDEX
   nvidia-smi || true
   gpustat --json || true
   echo "gpu_inventory_end"
-  echo "frozen_protocol=N=16 init=16 M=8 R=8 mutation=64 B=80 ppo=500 search=[42] validation=[200,201,202] test=[300,301,302,303,304] all-candidates-per-stage-parallel"
+  echo "budget_protocol=isaac_gym_smc: N=16 init=16 M=8 R=8 mutation=64 B=80; full batch parallelism follows the protocol"
 } | tee "$LAUNCH_LOG"
 
 exec python -u eureka_smc.py \
   env=ant \
   suffix=GPT \
   policy_train_iterations=500 \
-  algo.n_particles=16 \
-  algo.init_budget=16 \
-  algo.children_per_round=8 \
-  algo.mutation_rounds=8 \
-  algo.mutation_budget=64 \
-  algo.budget=80 \
-  algo.k_min=2 \
-  algo.seed=0 \
   algo.evaluation.search_seed_panel='[42]' \
-  algo.evaluation.max_concurrent_evals=16 \
   algo.evaluation.cache=false \
-  algo.evaluation.startup_timeout_seconds=600 \
-  algo.evaluation.training_timeout_seconds=7200 \
-  algo.evaluation.lock_timeout_seconds=300 \
   algo.reevaluation.enabled=true \
   algo.reevaluation.archive_top_k=3 \
   algo.reevaluation.validation_seed_panel='[200,201,202]' \
