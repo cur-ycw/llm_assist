@@ -4,3 +4,7 @@ description: This class corresponds to the LiftUnderarm task. This environment r
   a practical skill.
 env_name: shadow_hand_lift_underarm
 task: ShadowHandLiftUnderarm
+
+# 迭代数 = RF-Agent 官方每任务标准(search / test); test 保基准全量。
+policy_train_iterations: 3000
+test_policy_train_iterations: 6000

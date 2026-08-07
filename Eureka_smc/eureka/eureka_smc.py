@@ -114,15 +114,33 @@ def main(cfg):
         aggregate=algo.score.aggregate, window_frac=algo.score.window_frac,
         lower=score_lower, upper=score_upper)
 
+    # 迭代数（RF-Agent 每任务标准）：cfg/env/<task>.yaml 为 per-task 真源；顶层
+    # policy_train_iterations / test_policy_train_iterations 为 CLI 覆盖钩子（非 null 时优先，供 smoke）。
+    # RF-Agent 多数任务 test = search 的 2×（search 减半以加速搜索，test 保基准全量）。
+    search_iters = cfg.get("policy_train_iterations")
+    if search_iters is None:
+        search_iters = cfg.env.get("policy_train_iterations", None)
+    search_iters = int(search_iters) if search_iters is not None else 3000
+    test_iters = cfg.get("test_policy_train_iterations")
+    if test_iters is None:
+        test_iters = cfg.env.get("test_policy_train_iterations", None)
+    test_iters = int(test_iters) if test_iters is not None else search_iters
+    logging.info(f"Iterations (RF-Agent standard): search={search_iters}, test={test_iters}")
+
     eval_cfg = IsaacGymEvalConfig(
         isaac_root_dir=ISAAC_ROOT_DIR, eureka_root_dir=EUREKA_ROOT_DIR, task=task,
         suffix=suffix, env_name=env_name, task_code_string=task_code_string,
-        output_file=output_file, max_iterations=cfg.policy_train_iterations,
+        output_file=output_file, max_iterations=search_iters,
         use_wandb=cfg.use_wandb, wandb_username=cfg.wandb_username,
         wandb_project=cfg.wandb_project, capture_video=cfg.capture_video,
         startup_timeout_seconds=algo.evaluation.get("startup_timeout_seconds", 600.0),
         training_timeout_seconds=algo.evaluation.get("training_timeout_seconds", 7200.0),
         lock_timeout_seconds=algo.evaluation.get("lock_timeout_seconds", 300.0))
+    # test/held-out 复评用独立迭代数（RF-Agent test_max_iterations），其余参数与 search 一致。
+    # 所有字段均为不可变标量，copy.copy 安全；_config_salt 含 max_iterations，故 test 缓存与 search 天然分离。
+    import copy
+    test_eval_cfg = copy.copy(eval_cfg)
+    test_eval_cfg.max_iterations = test_iters
 
     ctx = TaskContext(initial_system=initial_system, initial_user=initial_user,
                       code_output_tip=prompts["code_output_tip"], model=cfg.model,
@@ -240,14 +258,14 @@ def main(cfg):
         validation_enabled = reeval.get("validation_enabled", True)
         test_seeds = list(reeval.test_seed_panel)
         test_eval = IsaacGymEvaluator(score_cfg, seeds=test_seeds, prompts=prompts,
-                                      eval_cfg=eval_cfg, cache=False,
+                                      eval_cfg=test_eval_cfg, cache=False,
                                       max_concurrent=max_concurrent)
         if validation_enabled:
             top_k = int(reeval.get("archive_top_k", 3))
             val_seeds = list(reeval.validation_seed_panel)
             logging.info(f"Reevaluation: top_k={top_k}, validation={val_seeds}, test={test_seeds}")
             validation_eval = IsaacGymEvaluator(score_cfg, seeds=val_seeds, prompts=prompts,
-                                                eval_cfg=eval_cfg, cache=False,
+                                                eval_cfg=test_eval_cfg, cache=False,
                                                 max_concurrent=max_concurrent)
             vt = run_validation_test(
                 archive, validation_eval, test_eval, top_k=top_k,
@@ -286,7 +304,7 @@ def main(cfg):
         heldout = list(algo.evaluation.heldout_seed_panel)
         logging.info(f"Reevaluation disabled; legacy single-best held-out on {heldout}")
         heldout_eval = IsaacGymEvaluator(score_cfg, seeds=heldout, prompts=prompts,
-                                         eval_cfg=eval_cfg, cache=False,
+                                         eval_cfg=test_eval_cfg, cache=False,
                                          max_concurrent=max_concurrent)
         rec = heldout_eval.evaluate(result.best.reward_code, "heldout",
                                     workspace_dir / "heldout")

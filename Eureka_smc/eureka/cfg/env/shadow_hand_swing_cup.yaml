@@ -3,3 +3,7 @@ description: This class corresponds to the SwingCup task. This environment invol
   cup together
 env_name: shadow_hand_swing_cup
 task: ShadowHandSwingCup
+
+# 迭代数 = RF-Agent 官方每任务标准(search / test); test 保基准全量。
+policy_train_iterations: 3000
+test_policy_train_iterations: 6000

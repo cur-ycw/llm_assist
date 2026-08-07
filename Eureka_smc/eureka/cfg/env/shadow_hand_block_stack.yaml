@@ -2,3 +2,7 @@ description: This class corresponds to the Block Stack task. This environment in
   dual hands and two blocks, and we need to stack the block as a tower.
 env_name: shadow_hand_block_stack
 task: ShadowHandBlockStack
+
+# 迭代数 = RF-Agent 官方每任务标准(search / test); test 保基准全量。
+policy_train_iterations: 3000
+test_policy_train_iterations: 6000

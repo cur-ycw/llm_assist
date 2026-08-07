@@ -1,3 +1,7 @@
 task: Humanoid # Environment class Name in the environment file
 env_name: humanoid # Environment file name
 description: to make the humanoid run as fast as possible
+
+# 迭代数 = RF-Agent 官方每任务标准(search / test); test 保基准全量。
+policy_train_iterations: 500
+test_policy_train_iterations: 1000

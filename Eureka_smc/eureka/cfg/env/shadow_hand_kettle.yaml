@@ -4,3 +4,7 @@ description: This class corresponds to the PourWater task. This environment invo
   practice task in Isaac Gym, we use many small balls to simulate the water
 env_name: shadow_hand_kettle
 task: ShadowHandKettle
+
+# 迭代数 = RF-Agent 官方每任务标准(search / test); test 保基准全量。
+policy_train_iterations: 3000
+test_policy_train_iterations: 6000

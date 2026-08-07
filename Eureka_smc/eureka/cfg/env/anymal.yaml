@@ -1,4 +1,7 @@
 task: Anymal
 env_name: anymal
 description: to make the quadruped follow randomly chosen x,y, and yaw target velocities
-max_iterations: 1000
+
+# 迭代数 = RF-Agent 官方每任务标准(search / test); test 保基准全量。
+policy_train_iterations: 500
+test_policy_train_iterations: 1000
