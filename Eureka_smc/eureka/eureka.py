@@ -17,7 +17,25 @@ from utils.create_task import create_task
 from utils.extract_task_code import *
 
 EUREKA_ROOT_DIR = os.getcwd()
-ISAAC_ROOT_DIR = f"{EUREKA_ROOT_DIR}/../isaacgymenvs/isaacgymenvs"
+
+
+def _resolve_isaac_root() -> str:
+    """指向 conda env 实际安装的 isaacgymenvs 包目录（与 eureka_smc.py 同一修复）。
+
+    关键正确性修复：train.py 内 ``import isaacgymenvs`` 解析到 pip 已安装包
+    （本机 /root/ycw/Eureka/isaacgymenvs），若 output_file/create_task 写到仓库自带的
+    /root/ycw/Eureka_smc/isaacgymenvs 副本，则 reward 注入写≠读、注入根本不生效，
+    训练的是已安装副本里的残留 reward（曾导致 Eureka 基线实际训练 SMC 冠军的污染）。
+    用 find_spec 定位已安装包保证写=读；找不到时回退仓库自带路径。
+    """
+    import importlib.util
+    spec = importlib.util.find_spec("isaacgymenvs")
+    if spec is not None and spec.origin:
+        return os.path.dirname(os.path.abspath(spec.origin))
+    return f"{EUREKA_ROOT_DIR}/../isaacgymenvs/isaacgymenvs"
+
+
+ISAAC_ROOT_DIR = _resolve_isaac_root()
 
 @hydra.main(config_path="cfg", config_name="config", version_base="1.1")
 def main(cfg):
