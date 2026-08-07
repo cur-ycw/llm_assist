@@ -16,7 +16,8 @@ suffix: GPT  # suffix for generated files (indicates LLM model)
 # Eureka parameters
 iteration: 1 # how many iterations of Eureka to run
 sample: 3 # number of Eureka samples to generate per iteration
-max_iterations: 3000 # RL Policy training iterations (decrease this to make the feedback loop faster)
+max_iterations: null # CLI 覆盖钩子(search PPO 迭代);null=用 cfg/env/<task>.yaml 的 RF-Agent per-task 标准
+test_policy_train_iterations: null # test 迭代(RF-Agent test_max_iterations);null=用 cfg/env 标准(ShadowHand 显式 6000，非 benchmark 默认 20000)
 num_eval: 5 # number of evaluation episodes to run for the final reward
 capture_video: False # whether to capture policy rollout videos
 

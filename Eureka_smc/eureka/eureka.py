@@ -38,6 +38,19 @@ def main(cfg):
     logging.info("Task: " + task)
     logging.info("Task description: " + task_description)
 
+    # 迭代数(RF-Agent 每任务标准,与 eureka_smc 同源):cfg/env/<task>.yaml 为真源;顶层
+    # cfg.max_iterations 为 CLI 覆盖(search)。test 显式传 test_policy_train_iterations,不再
+    # 回落 isaacgymenvs benchmark 默认(ShadowHand 默认 20000≠标准 6000,会不可比且慢 3×)。
+    search_iters = cfg.get("max_iterations")
+    if search_iters is None:
+        search_iters = cfg.env.get("policy_train_iterations", None)
+    search_iters = int(search_iters) if search_iters is not None else 3000
+    test_iters = cfg.get("test_policy_train_iterations")
+    if test_iters is None:
+        test_iters = cfg.env.get("test_policy_train_iterations", None)
+    test_iters = int(test_iters) if test_iters is not None else search_iters
+    logging.info(f"Iterations (RF-Agent standard): search={search_iters}, test={test_iters}")
+
     env_name = cfg.env.env_name.lower()
     env_parent = 'isaac' if f'{env_name}.py' in os.listdir(f'{EUREKA_ROOT_DIR}/envs/isaac') else 'dexterity'
     task_file = f'{EUREKA_ROOT_DIR}/envs/{env_parent}/{env_name}.py'
@@ -197,7 +210,7 @@ def main(cfg):
                                             f'task={task}{suffix}', f'wandb_activate={cfg.use_wandb}',
                                             f'wandb_entity={cfg.wandb_username}', f'wandb_project={cfg.wandb_project}',
                                             f'headless={not cfg.capture_video}', f'capture_video={cfg.capture_video}', 'force_render=False',
-                                            f'max_iterations={cfg.max_iterations}'],
+                                            f'max_iterations={search_iters}'],
                                             stdout=f, stderr=f)
             block_until_training(rl_filepath, log_status=True, iter_num=iter, response_id=response_id)
             rl_runs.append(process)
@@ -363,6 +376,7 @@ def main(cfg):
                                         f'task={task}{suffix}', f'wandb_activate={cfg.use_wandb}',
                                         f'wandb_entity={cfg.wandb_username}', f'wandb_project={cfg.wandb_project}',
                                         f'headless={not cfg.capture_video}', f'capture_video={cfg.capture_video}', 'force_render=False', f'seed={i}',
+                                        f'max_iterations={test_iters}',
                                         ],
                                         stdout=f, stderr=f)
 
