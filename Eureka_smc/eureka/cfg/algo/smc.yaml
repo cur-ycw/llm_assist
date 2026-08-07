@@ -67,7 +67,7 @@ actions:
 score:
   metric: consecutive_successes
   fallback_metric: gt_reward
-  aggregate: final_window_mean   # 非 max：避免乐观高方差选择偏差（审查 #4）
+  aggregate: max                 # 与 Eureka/RF-Agent 原生口径统一（曲线峰值 max）；三方同表可比（2026-08-07）
   window_frac: 0.1
   lower: 0.0                      # 已退出热路径
   upper: 1.0                      # 已退出热路径
