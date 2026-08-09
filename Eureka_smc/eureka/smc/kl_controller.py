@@ -59,13 +59,23 @@ def _scores(scores: Sequence[float]) -> np.ndarray:
     return scores
 
 
-def tau_budget(h: float, k_min: float, n: int) -> float:
-    """Budget-only rESS target, linearly interpolated from ``k_min/n`` to one."""
+def tau_budget(h: float, k_min: float, n: int, k_cap: Optional[float] = None) -> float:
+    """Budget-only rESS target, linearly interpolated from ``k_min/n`` to ``k_cap/n``.
+
+    ``k_cap`` upper-bounds the target effective-parent count.  It defaults to ``n``
+    (legacy: interpolate up to the whole resident population).  Pass
+    ``k_cap=children_per_round`` so the target is expressed against the number of
+    offspring actually drawn each round (M), not the population (N): with N=16 draws
+    of M=8, a target above 8 is unrealizable and leaves the first rounds' selection
+    a no-op.
+    """
     if n <= 0:
         raise ValueError("n must be positive")
     h = float(np.clip(h, 0.0, 1.0))
     tau_floor = float(np.clip(k_min, 1.0, n)) / float(n)
-    return float(tau_floor + (1.0 - tau_floor) * h)
+    cap = float(n) if k_cap is None else float(np.clip(k_cap, float(np.clip(k_min, 1.0, n)), n))
+    tau_ceil = cap / float(n)
+    return float(tau_floor + (tau_ceil - tau_floor) * h)
 
 
 def target_relative_ess(
@@ -75,12 +85,15 @@ def target_relative_ess(
     k_min: float,
     eta: float = 1.0,
     progress_prev: float = 0.0,
+    k_cap: Optional[float] = None,
 ) -> float:
     """Return the delayed-progress target rESS.
 
     Positive preceding progress makes the next-round parent allocation more
     concentrated; negative progress preserves more diversity.  ``progress_prev``
-    is clipped to the natural ``[-1, 1]`` range of Gamma.
+    is clipped to the natural ``[-1, 1]`` range of Gamma.  ``k_cap`` upper-bounds
+    the target effective-parent count (defaults to ``n``); with ``k_cap`` set, even
+    the diversity-preserving branch relaxes only up to ``k_cap/n``, not to one.
     """
     if B <= 0.0 or n <= 0:
         raise ValueError("B and n must be positive")
@@ -90,9 +103,11 @@ def target_relative_ess(
         raise ValueError("progress_prev must be finite")
     h = float(np.clip(b / B, 0.0, 1.0))
     floor = float(np.clip(k_min, 1.0, n)) / float(n)
-    base = tau_budget(h, k_min, n)
+    cap = float(n) if k_cap is None else float(np.clip(k_cap, float(np.clip(k_min, 1.0, n)), n))
+    ceil = cap / float(n)
+    base = tau_budget(h, k_min, n, k_cap)
     gamma_prev = float(np.clip(progress_prev, -1.0, 1.0))
-    return float(np.clip(base * np.exp(-eta * h * gamma_prev), floor, 1.0))
+    return float(np.clip(base * np.exp(-eta * h * gamma_prev), floor, ceil))
 
 
 def target_effective_parents(
@@ -423,11 +438,15 @@ def resolve(
     progress_prev: float = 0.0,
     weights: Optional[Sequence[float]] = None,
     U: Optional[Sequence[float]] = None,
+    k_cap: Optional[float] = None,
 ) -> ControllerStep:
     """Resolve one round from budget plus the *previous* round's Gamma.
 
     ``gamma`` is accepted for old callers (including the untouched island), but is
     ignored.  ``U`` is the optional explicit Full utility and defaults to ``scores``.
+    ``k_cap`` upper-bounds the target effective-parent count (defaults to ``n``); set
+    it to ``children_per_round`` so the schedule is anchored to the M offspring drawn
+    per round instead of the resident population N.
     """
     del gamma
     raw_scores = _scores(scores)
@@ -435,8 +454,8 @@ def resolve(
     if utility.size != raw_scores.size or n != raw_scores.size:
         raise ValueError("n, scores, and U must have the same length")
     h = float(np.clip(b / B, 0.0, 1.0)) if B > 0.0 else (_ for _ in ()).throw(ValueError("B must be positive"))
-    tau_b = tau_budget(h, k_min, n)
-    tau_target = target_relative_ess(b, B, n, k_min, eta, progress_prev)
+    tau_b = tau_budget(h, k_min, n, k_cap)
+    tau_target = target_relative_ess(b, B, n, k_min, eta, progress_prev, k_cap)
     normalized, span = normalize_potential(utility)
     if span == 0.0:
         tau_feas, k_feas, m_ties = 1.0, float(n), n

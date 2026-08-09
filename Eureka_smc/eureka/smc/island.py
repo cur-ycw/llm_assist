@@ -487,7 +487,8 @@ class SMCIsland:
                                      float(self.cfg.k_min),
                                      eta=float(self.cfg.eta),
                                      progress_prev=float(progress_prev),
-                                     U=U_t, weights=W_t)
+                                     U=U_t, weights=W_t,
+                                     k_cap=float(self.cfg.children_per_round))
         m_t = min(self.cfg.children_per_round, int(b_t))   # 最后一轮允许不足 M，正常情况下固定为 M
         idx = multinomial_resample(step.q, m_t, self.rng)
 

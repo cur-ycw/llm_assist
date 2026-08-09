@@ -17,7 +17,7 @@ budget_protocols:
     mutation_rounds: 8
     mutation_budget: 64
     budget: 80
-    k_min: 2
+    k_min: 1
   bidex:
     n_particles: 64
     init_budget: 64
