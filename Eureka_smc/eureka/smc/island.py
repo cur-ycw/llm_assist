@@ -65,6 +65,7 @@ class SMCIslandConfig:
     eta: float = 1.0               # 进展延迟反馈增益：τ_t = τ_budget(h)·exp(-η·h·Γ_{t-1})
     max_init_repair: int = 8        # 初始种子 traceback-repair 的最大波数（RF-Agent 式，≈其 max_try_num=9）
     max_same_repair: int = 3        # 同一种子连续修复失败多少次后丢弃、改抽全新（RF-Agent max_same_try_cnt）
+    max_mutation_repair: int = 0    # 修改轮无效子代 traceback-repair 的最大波数（RF-Agent 式；0=关，与旧路径逐字节一致）
     seed: int = 0
     action_cfg: Optional[ActionConfig] = None  # 五操作路由（None/generic=单一 eureka_reflection）
 
@@ -468,6 +469,60 @@ class SMCIsland:
         cum = np.cumsum(x)
         return float((n + 1 - 2.0 * cum.sum() / cum[-1]) / n)
 
+    def _repair_children(self, children: list[RewardParticle], specs: list[dict],
+                         slots: list[int], round_idx: int) -> list[RewardParticle]:
+        """对本轮无效子代做 traceback-repair（RF-Agent 式，与 ``initialize()`` 同款）。
+
+        逐波：把仍无效子代的 ``(代码, traceback)`` 喂回 ``proposer.repair_batch`` 重生成 →
+        经 ``_make_particles_batch`` 重新评估 → 用修好的**原位替换**（沿用该 slot 的父代/
+        provenance，故与 ``slots`` 对齐不变、接受阶段回写到正确的原始父代槽位）。
+
+        预算：修复重跑走 evaluator（计入 ``physical_rl_evals``）但**不触碰 ``b_t``**，故不计入
+        B=80——与 init 修复、RF-Agent（每子代仅计 1 个 sim_time）口径一致。``max_mutation_repair``
+        给波数上限；同一 slot 连修失败 ``max_same_repair`` 次即放弃（该 slot 保持无效 → 接受阶段
+        退回父代，等价旧行为）。``max_mutation_repair<=0``（默认）时直接返回，零 rng 消耗、逐字节
+        等旧路径。
+        """
+        can_repair = (hasattr(self.proposer, "repair_batch")
+                      and self.cfg.max_mutation_repair > 0)
+        if not can_repair:
+            return children
+        tries = [0] * len(children)
+        waves = 0
+        while waves < self.cfg.max_mutation_repair:
+            todo = [j for j, c in enumerate(children)
+                    if not c.valid and tries[j] + 1 < self.cfg.max_same_repair]
+            if not todo:
+                break
+            waves += 1
+            repair_items = [(children[j].reward_code,
+                             children[j].eval.error or "execution error") for j in todo]
+            fixed = self.proposer.repair_batch(repair_items)
+            re_specs: list[dict] = []
+            re_pos: list[int] = []
+            for j, rc in zip(todo, fixed):
+                tries[j] += 1                       # 失败（rc 为空）也计一次，逼近 max_same_repair
+                if not rc:
+                    continue
+                s = specs[j]
+                re_specs.append(dict(
+                    code=rc, generation=s["generation"],
+                    proposal_parent_id=s.get("proposal_parent_id"),
+                    clone_ancestor_id=None,
+                    proposal_action=s.get("proposal_action"),
+                    design_thought=s.get("design_thought"),
+                    parent_code=s.get("parent_code")))
+                re_pos.append(j)
+            if not re_specs:
+                continue
+            repaired = self._make_particles_batch(re_specs)
+            for j, p in zip(re_pos, repaired):
+                self.log.log("mutation_repair", id=p.id, stage=round_idx,
+                             slot_parent=specs[j].get("proposal_parent_id"),
+                             valid=p.eval.valid, wave=waves, tries=tries[j])
+                children[j] = p                     # 原位替换，slots 对齐不变
+        return children
+
     def _round(self, particles: list[RewardParticle], b_t: int, round_idx: int,
                progress_prev: float = 0.0
                ) -> tuple[list[RewardParticle], "kl_controller.ControllerStep", int, float]:
@@ -546,6 +601,10 @@ class SMCIsland:
                 parent_code=c.reward_code))
             slots.append(i)
         children = self._make_particles_batch(specs)
+        # 无效子代 traceback-repair（RF-Agent 式，与 initialize() 同款）：修复重跑经 evaluator
+        # 计入 physical_rl_evals 但**不触碰 b_t**，故不计入 B=80（与 init 修复、RF-Agent 每子代
+        # 仅计 1 个 sim_time 同口径）。max_mutation_repair=0（默认）→ 直接返回，逐字节等旧路径。
+        children = self._repair_children(children, specs, slots, round_idx)
         # Y_t：本轮**原始**子代分数（接受前，用于进展度量；无效子代按当轮 floor 兜底）。
         child_scores = [c.search_score if (c.valid and c.search_score is not None) else floor
                         for c in children]

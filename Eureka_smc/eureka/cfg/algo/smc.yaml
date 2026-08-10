@@ -44,6 +44,7 @@ eta: 1.0                     # 延迟进展反馈增益 η（τ_t=τ_budget(h)·
 seed: 0                      # 岛屿 RNG 种子
 max_init_repair: 8           # 初始种子 traceback-repair 最大波数（RF-Agent 式：报错喂回让 LLM 自修复）
 max_same_repair: 3           # 同一种子连修失败多少次后改抽全新（RF-Agent max_same_try_cnt）
+max_mutation_repair: 8       # 修改轮无效子代 traceback-repair 最大波数（RF-Agent 式；0=关。无效子代出现时才触发，全 valid 轮零开销）
 migration_enabled: false     # 粒子迁移仅 source_compat 开启
 
 # RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5），与父代分配层正交。

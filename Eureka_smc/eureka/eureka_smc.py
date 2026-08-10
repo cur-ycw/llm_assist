@@ -222,6 +222,7 @@ def main(cfg):
             mutation_budget=algo.get("mutation_budget"),
             k_min=algo.k_min, gamma=algo.gamma, eta=algo.get("eta", 1.0),
             max_init_repair=algo.max_init_repair, max_same_repair=algo.max_same_repair,
+            max_mutation_repair=algo.get("max_mutation_repair", 0),
             seed=algo.seed, action_cfg=action_cfg),
         proposer, evaluator,
         event_log,

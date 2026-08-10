@@ -73,6 +73,48 @@ def test_init_repair_disabled_falls_back(tmp_path):
     assert all(p.valid for p in ps)
 
 
+class _MutInvalidOnceProposer(FakeProposer):
+    """测试替身：首个变异子代（reflect 首调）强制无效，其余正常；repair_batch 修成有效。
+
+    用于验证 mutation 轮的 traceback-repair：初始化只走 initial_batch/repair_batch，不触碰
+    reflect，故 ``_injected`` 到第一次变异 reflect 才翻转，确保恰好注入一个无效变异子代。
+    """
+
+    def __init__(self, rng, **kw):
+        super().__init__(rng, **kw)
+        self._injected = False
+
+    def reflect(self, parent_code: str, parent_feedback: str):
+        if not self._injected:
+            self._injected = True
+            return self._INVALID          # 一个无效变异子代
+        return super().reflect(parent_code, parent_feedback)
+
+
+def test_mutation_repair_fixes_invalid_child(tmp_path):
+    # 变异轮出现无效子代时，RF-Agent 式 repair 应把它修成有效（不再白白少一个 valid 算子）。
+    proposer = _MutInvalidOnceProposer(np.random.default_rng(1))
+    island, log_path = _island(proposer, tmp_path, max_mutation_repair=8)
+    particles = island.initialize()
+    island._round(particles, b_t=island.cfg.mutation_budget, round_idx=0)
+    reps = [e for e in _events(log_path) if e["event"] == "mutation_repair"]
+    assert reps, "应触发至少一次 mutation 修复"
+    assert any(e["valid"] for e in reps), "修复后应产出有效子代"
+
+
+def test_mutation_repair_disabled_leaves_invalid(tmp_path):
+    # max_mutation_repair=0（默认）时不修复：无效变异子代进接受阶段被判 invalid_child、槽位退回父代。
+    proposer = _MutInvalidOnceProposer(np.random.default_rng(1))
+    island, log_path = _island(proposer, tmp_path, max_mutation_repair=0)
+    particles = island.initialize()
+    island._round(particles, b_t=island.cfg.mutation_budget, round_idx=0)
+    evs = _events(log_path)
+    assert not [e for e in evs if e["event"] == "mutation_repair"]
+    assert any(e["event"] == "accept_decision" and e.get("reason") == "invalid_child"
+               for e in evs), "关闭修复时无效子代应被判 invalid_child"
+
+
+
 def test_explicit_budget_split_requires_consistent_rounds(tmp_path):
     island, _ = _build(tmp_path, init_budget=8, mutation_budget=8, mutation_rounds=2)
     assert island.cfg.budget == 16
