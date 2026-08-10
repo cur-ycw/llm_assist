@@ -20,6 +20,7 @@ suffix: GPT
 # RL 训练参数
 policy_train_iterations: null       # CLI 覆盖钩子；null=用 cfg/env/<task>.yaml 的 RF-Agent per-task 标准（search）
 test_policy_train_iterations: null  # 同上；test 复评迭代数（RF-Agent test_max_iterations，多数任务为 search 的 2×）
+retest_champion_code: null          # 给定已存冠军奖励代码路径时=test-only 重评（跳过搜索，仅对该冠军跑 test）
 num_eval: 5                    # 最终 held-out 复评次数（兼容旧 Eureka）
 capture_video: False
 

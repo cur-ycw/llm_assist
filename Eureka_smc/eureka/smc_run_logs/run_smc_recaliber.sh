@@ -60,6 +60,38 @@ run_smc() {
   wait_gpu_free
 }
 
+MARK_RETEST='champion test raw J mean='
+
+# allegro champion(i0-p38)test-only 补跑:搜索不受超时影响,只有 5000-iter test 被旧
+# 7200s 削掉 seed0。用固定 best_reward_code.py + 新无超时评估器,只重跑 5 seed 的 test。
+run_allegro_retest() {
+  local champ tag ws log
+  champ="/root/ycw/Eureka_smc/eureka/outputs/batch/allegro_hand/smc/20260809T122119Z_smc_allegro_hand_MAX_b80/best_reward_code.py"
+  tag="allegro_hand_smc_RETEST5seed_$(stamp)"
+  ws="$OUTROOT/${tag}"
+  log="$LOGDIR/${tag}.log"
+  mkdir -p "$ws"
+  if [ ! -f "$champ" ]; then
+    row allegro_hand SMC-RETEST FAIL "$log" "champion 代码不存在: $champ"
+    return
+  fi
+  row allegro_hand SMC-RETEST START "$log" "test-only 5-seed 无超时"
+  ( source "$CONDA_SH"; conda activate eureka; export EUREKA_KEY_INDEX=0; source /root/ycw/Eureka_smc/env.sh; cd "$SMC_ROOT"
+    python -u eureka_smc.py env=allegro_hand suffix=GPT \
+      "retest_champion_code=$champ" \
+      algo.evaluation.cache=false \
+      algo.reevaluation.enabled=true algo.reevaluation.test_seed_panel='[0,1,2,3,4]' \
+      "hydra.run.dir=$ws"
+  ) >"$log" 2>&1
+  if grep -q "$MARK_RETEST" "$log"; then
+    row allegro_hand SMC-RETEST DONE "$log" "$(grep "$MARK_RETEST" "$log" | tail -1 | tr '\t' ' ')"
+  else
+    row allegro_hand SMC-RETEST FAIL "$log" "$(tail -1 "$log" | tr '\t' ' ')"
+  fi
+  wait_gpu_free
+}
+
+
 guard
 wait_gpu_free
 echo "[recaliber] start $(stamp)  out=$OUTROOT"
@@ -71,5 +103,8 @@ run_smc humanoid
 run_smc anymal
 run_smc franka_cabinet
 
+# allegro champion 5-seed 无超时 test 补跑(与 4 个 SMC 串行,不抢 GPU)。
+run_allegro_retest
+
 echo "[recaliber] all done $(stamp)"
-row ALL RECALIBER DONE "$PROGRESS" "4 SMC 新口径补跑完成"
+row ALL RECALIBER DONE "$PROGRESS" "4 SMC 新口径补跑 + allegro 5-seed retest 完成"

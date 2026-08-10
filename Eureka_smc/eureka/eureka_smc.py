@@ -182,6 +182,32 @@ def main(cfg):
         validation_seeds = list(algo.evaluation.validation_seed_panel)
         test_seeds = list(algo.evaluation.test_seed_panel)
     check_seed_panels(validation_seeds, test_seeds, search_seeds)
+
+    # ---- 冠军 test-only 重评（retest_champion_code=<path>）----
+    # 给定已保存的冠军奖励代码路径时，跳过整段搜索，仅用当前评估器对该冠军在 test seeds 上
+    # 复评（cache=false）。用于在评估器口径变更（如去掉训练超时）后，对搜索阶段不受影响、
+    # 仅最终 test 被削的冠军做干净补跑，无需重跑 ~24h 的搜索。
+    retest_path = cfg.get("retest_champion_code", None)
+    if retest_path:
+        champion_code = Path(retest_path).read_text()
+        logging.info(f"[RETEST] champion={retest_path} | test_seeds={test_seeds} | "
+                     f"test_iters={test_iters} | training_timeout="
+                     f"{test_eval_cfg.training_timeout_seconds}")
+        retest_eval = IsaacGymEvaluator(score_cfg, seeds=test_seeds, prompts=prompts,
+                                        eval_cfg=test_eval_cfg, cache=False,
+                                        max_concurrent=max_concurrent)
+        rec = retest_eval.evaluate(champion_code, "champion_retest",
+                                   workspace_dir / "retest")
+        per_seed = rec.reward_components.get("per_seed", []) if rec else []
+        logging.info(f"[RETEST] champion test raw J mean={rec.search_score}, per_seed={per_seed}")
+        (workspace_dir / "retest_result.json").write_text(json.dumps(
+            {"champion_code": str(retest_path), "test_seeds": test_seeds,
+             "test_iters": test_iters, "training_timeout_seconds": test_eval_cfg.training_timeout_seconds,
+             "test_search_score": rec.search_score, "per_seed": per_seed,
+             "valid": rec.valid, "error": rec.error},
+            default=str, ensure_ascii=False, indent=2))
+        return
+
     manifest_budget = {
         "n_particles": int(algo.n_particles),
         "init_budget": int(algo.init_budget),
