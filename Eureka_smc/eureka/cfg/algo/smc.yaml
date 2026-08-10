@@ -84,7 +84,7 @@ evaluation:
   # 上限由环境族 population 槽位派生；init 和 mutation 均在容量允许时整批启动。
   max_concurrent_evals: ${..n_particles}
   startup_timeout_seconds: 600                      # 等待训练 import reward 源码的上限；超时会清理子进程
-  training_timeout_seconds: 7200                    # 单个 train.py 训练上限；超时会清理子进程
+  training_timeout_seconds: null                    # 不设训练超时（communicate 无限等）；慢任务(5000-iter 手部)不再被误杀丢 seed。卡在 import 仍由 startup_timeout 兜底
   lock_timeout_seconds: 300                          # 获取跨进程共享 task 注入锁的上限
 
 # Stage-boundary runtime checkpoint. `resume_from` must point to a checkpoint

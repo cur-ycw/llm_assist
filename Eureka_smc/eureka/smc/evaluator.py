@@ -140,10 +140,14 @@ class IsaacGymEvalConfig:
                  max_iterations: int, use_wandb: bool = False, wandb_username: str = "",
                  wandb_project: str = "", capture_video: bool = False,
                  startup_timeout_seconds: float = 600.0,
-                 training_timeout_seconds: float = 7200.0,
+                 training_timeout_seconds: Optional[float] = None,
                  lock_timeout_seconds: float = 300.0):
-        if startup_timeout_seconds <= 0 or training_timeout_seconds <= 0 or lock_timeout_seconds <= 0:
-            raise ValueError("Isaac Gym evaluator timeouts must be positive")
+        # training_timeout_seconds=None → 不设训练超时（慢任务如 5000-iter AllegroHand/ShadowHand
+        # 不会被误杀丢 seed）；卡在 import 仍由 startup_timeout 兜底。startup/lock 必须为正。
+        if startup_timeout_seconds <= 0 or lock_timeout_seconds <= 0:
+            raise ValueError("Isaac Gym startup/lock timeouts must be positive")
+        if training_timeout_seconds is not None and training_timeout_seconds <= 0:
+            raise ValueError("training_timeout_seconds must be positive or None (disabled)")
         self.isaac_root_dir = isaac_root_dir
         self.eureka_root_dir = eureka_root_dir
         self.task = task
@@ -157,7 +161,8 @@ class IsaacGymEvalConfig:
         self.wandb_project = wandb_project
         self.capture_video = capture_video
         self.startup_timeout_seconds = float(startup_timeout_seconds)
-        self.training_timeout_seconds = float(training_timeout_seconds)
+        self.training_timeout_seconds = (
+            float(training_timeout_seconds) if training_timeout_seconds is not None else None)
         self.lock_timeout_seconds = float(lock_timeout_seconds)
 
 

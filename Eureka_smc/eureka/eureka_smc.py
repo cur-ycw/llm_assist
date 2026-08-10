@@ -134,7 +134,7 @@ def main(cfg):
         use_wandb=cfg.use_wandb, wandb_username=cfg.wandb_username,
         wandb_project=cfg.wandb_project, capture_video=cfg.capture_video,
         startup_timeout_seconds=algo.evaluation.get("startup_timeout_seconds", 600.0),
-        training_timeout_seconds=algo.evaluation.get("training_timeout_seconds", 7200.0),
+        training_timeout_seconds=algo.evaluation.get("training_timeout_seconds", None),
         lock_timeout_seconds=algo.evaluation.get("lock_timeout_seconds", 300.0))
     # test/held-out 复评用独立迭代数（RF-Agent test_max_iterations），其余参数与 search 一致。
     # 所有字段均为不可变标量，copy.copy 安全；_config_salt 含 max_iterations，故 test 缓存与 search 天然分离。
