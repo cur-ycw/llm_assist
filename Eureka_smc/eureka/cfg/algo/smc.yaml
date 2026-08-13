@@ -50,7 +50,7 @@ migration_enabled: false     # 粒子迁移仅 source_compat 开启
 # ---- 接受容忍度收紧（消融开关，默认精确 no-op，主表/recaliber 口径不受影响）----
 # 现状接受核 p=sigmoid(alpha·delta/span) 在孤峰/宽 span 地形上对"改差子代"过于宽容
 # （中段差满一个 span 仍 ~8% 溜进去）。β 独立压低容忍度，且不动 SMC 重采样温度。
-accept_sharpness: 1.0        # β：接受判定专用锐度 z=β·alpha·delta/span。1.0=现状；消融取 ~3 把中大幅退步长尾砍掉
+accept_sharpness: 1.0        # β：接受判定专用锐度 z=β·alpha·delta/span。1.0=现状；消融取 5（差1.5分即基本不接受，近平局仍探索）
 
 # RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5），与父代分配层正交。
 # mode=generic（默认）：单一 eureka_reflection 通用反思。
