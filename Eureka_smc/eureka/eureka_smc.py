@@ -249,7 +249,9 @@ def main(cfg):
             k_min=algo.k_min, gamma=algo.gamma, eta=algo.get("eta", 1.0),
             max_init_repair=algo.max_init_repair, max_same_repair=algo.max_same_repair,
             max_mutation_repair=algo.get("max_mutation_repair", 0),
-            seed=algo.seed, action_cfg=action_cfg),
+            seed=algo.seed, action_cfg=action_cfg,
+            accept_sharpness=float(algo.get("accept_sharpness", 1.0)),
+            accept_floor_frac=float(algo.get("accept_floor_frac", 0.0))),
         proposer, evaluator,
         event_log,
         artifact_root=workspace_dir / "candidates")

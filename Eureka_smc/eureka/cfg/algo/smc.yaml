@@ -47,6 +47,12 @@ max_same_repair: 3           # 同一种子连修失败多少次后改抽全新�
 max_mutation_repair: 8       # 修改轮无效子代 traceback-repair 最大波数（RF-Agent 式；0=关。无效子代出现时才触发，全 valid 轮零开销）
 migration_enabled: false     # 粒子迁移仅 source_compat 开启
 
+# ---- 接受容忍度收紧（消融开关，默认精确 no-op，主表/recaliber 口径不受影响）----
+# 现状接受核 p=sigmoid(alpha·delta/span) 在孤峰/宽 span 地形上对"改差子代"过于宽容
+# （中段差满一个 span 仍 ~8% 溜进去）。以下两个旋钮独立压低容忍度，且不动 SMC 重采样温度。
+accept_sharpness: 1.0        # β：接受判定专用锐度 z=β·alpha·delta/span。1.0=现状；消融取 ~3 把中大幅退步长尾砍掉
+accept_floor_frac: 0.0       # 硬地板：子代 J<frac×父代 J 直接否决。0.0=关；消融取 ~0.7 封死"崩到地板"式灾难接受（仅正-分手部任务）
+
 # RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5），与父代分配层正交。
 # mode=generic（默认）：单一 eureka_reflection 通用反思。
 # mode=rf：按 enabled 中各 action 对应 rf_ratio 权重确定性派发。历史料由 island 确定性从注册表
