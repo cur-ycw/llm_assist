@@ -70,7 +70,6 @@ class SMCIslandConfig:
     action_cfg: Optional[ActionConfig] = None  # 五操作路由（None/generic=单一 eureka_reflection）
     # ---- 接受容忍度收紧（默认精确 no-op；仅消融时开启）----
     accept_sharpness: float = 1.0   # β：接受判定专用锐度，z=β·alpha·delta/span。1.0=现状；>1 更快砍掉中大幅退步的长尾（不动重采样温度）
-    accept_floor_frac: float = 0.0  # 硬地板：子代 J < frac×父代 J 直接否决（p=0）。0.0=关。为正-分手部任务设计（consecutive_successes≥0）
 
     def __post_init__(self) -> None:
         """校验初始化池、每轮修改资源和总候选预算的关系。"""
@@ -116,8 +115,6 @@ class SMCIslandConfig:
             raise ValueError("eta must be finite and non-negative")
         if self.accept_sharpness <= 0 or not np.isfinite(self.accept_sharpness):
             raise ValueError("accept_sharpness must be finite and positive")
-        if self.accept_floor_frac < 0.0 or self.accept_floor_frac >= 1.0:
-            raise ValueError("accept_floor_frac must lie in [0, 1)")
 
 
 @dataclass
@@ -666,23 +663,14 @@ class SMCIsland:
         delta = child.search_score - (current.search_score or 0.0)
         improved = delta > 0.0
         normalized_delta = delta / potential_span if potential_span > 0.0 else 0.0
-        # 硬地板否决（C，默认关）：仅对未改进子代生效，且父代分为正时才有意义。
-        # 子代绝对分 < frac×父代绝对分 → 直接封死（防"崩到地板"类灾难接受）。
-        floor_frac = self.cfg.accept_floor_frac
-        floored = (not improved and floor_frac > 0.0
-                   and (current.search_score or 0.0) > 0.0
-                   and child.search_score < floor_frac * (current.search_score or 0.0))
-        if floored:
-            accept = False
-            p_accept = 0.0
-        elif improved:
+        if improved:
             accept = True
             p_accept = 1.0
         elif potential_span == 0.0:
             p_accept = 0.5
             accept = self.rng.random() < p_accept
         else:
-            # 接受专用锐度 β（A，默认 1=现状）；重采样温度不受影响。
+            # 接受专用锐度 β（默认 1=现状）；重采样温度不受影响。
             z = float(self.cfg.accept_sharpness * alpha_t * normalized_delta)
             # Stable sigmoid; the non-improvement branch has z <= 0.
             p_accept = float(np.exp(z) / (1.0 + np.exp(z))) if z >= -40.0 else 0.0
@@ -690,8 +678,7 @@ class SMCIsland:
         self.log.log("accept_decision", parent=current.id, child=child.id, stage=round_idx,
                      delta=delta, normalized_delta=normalized_delta, alpha=alpha_t,
                      potential_span=potential_span,
-                     accept_sharpness=self.cfg.accept_sharpness, accept_floor_frac=floor_frac,
-                     floored=floored,
+                     accept_sharpness=self.cfg.accept_sharpness,
                      lambda_equivalent=(alpha_t / potential_span if potential_span > 0.0 else 0.0),
                      p_accept=p_accept, improved=improved, accepted=accept)
         return child if accept else current
