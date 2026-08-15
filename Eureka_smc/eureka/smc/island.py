@@ -26,6 +26,7 @@ provenance（不变量）：
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import logging
@@ -70,6 +71,12 @@ class SMCIslandConfig:
     action_cfg: Optional[ActionConfig] = None  # 五操作路由（None/generic=单一 eureka_reflection）
     # ---- 接受容忍度收紧（默认精确 no-op；仅消融时开启）----
     accept_sharpness: float = 1.0   # β：接受判定专用锐度，z=β·alpha·delta/span。1.0=现状；>1 更快砍掉中大幅退步的长尾（不动重采样温度）
+    # ---- 失败探索记忆（默认精确 no-op；仅消融时开启）----
+    # 被拒子代（valid 但更差）按父代 state_origin_id 记 b+c 摘要（分量增减 + ΔJ）；下一轮从
+    # 同一父代变异时把摘要插进 prompt，令 LLM 避开已试过的失败方向。关闭时不记录、不注入，
+    # feedback 字符串逐字节不变 → rng 消费与 determinism 不受影响。
+    failure_memory_enabled: bool = False
+    failure_memory_k: int = 3       # 每个父代最多保留最近 k 条失败摘要（防 prompt 膨胀）
 
     def __post_init__(self) -> None:
         """校验初始化池、每轮修改资源和总候选预算的关系。"""
@@ -115,6 +122,8 @@ class SMCIslandConfig:
             raise ValueError("eta must be finite and non-negative")
         if self.accept_sharpness <= 0 or not np.isfinite(self.accept_sharpness):
             raise ValueError("accept_sharpness must be finite and positive")
+        if self.failure_memory_k < 1:
+            raise ValueError("failure_memory_k must be >= 1")
 
 
 @dataclass
@@ -145,6 +154,8 @@ class SMCIsland:
         # 粒子（id→粒子），供体/谱系/异谱系意图都从这里确定性选出。generic/变异路径不读它，
         # 只写不读，故不影响 Phase-2/3a 行为与 rng 消费。
         self._registry: dict[str, RewardParticle] = {}
+        # 失败探索记忆：state_origin_id → [被拒子代 b+c 摘要]（默认关时恒空、不读不写）。
+        self._failure_memory: dict[str, list[str]] = {}
         ac = config.action_cfg
         self._crossover_k = getattr(ac, "crossover_k", 2) if ac is not None else 2
         self._history_k = getattr(ac, "history_k", 4) if ac is not None else 4
@@ -152,6 +163,9 @@ class SMCIsland:
     def _config_fingerprint(self) -> str:
         payload = asdict(self.cfg)
         payload["action_cfg"] = asdict(self.cfg.action_cfg) if self.cfg.action_cfg else None
+        # 失败记忆开关默认关时精确 no-op：排除出指纹，令旧 checkpoint 在加了该字段的新代码下仍可续跑。
+        payload.pop("failure_memory_enabled", None)
+        payload.pop("failure_memory_k", None)
         encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -189,6 +203,7 @@ class SMCIsland:
             "population": [p.to_json() for p in population],
             "best_id": self.best.id if self.best else None,
             "registry": [p.to_json() for p in self._registry.values()],
+            "failure_memory": {k: list(v) for k, v in self._failure_memory.items()},
             "archive": self.archive.snapshot(),
             "ledger": self.ledger.snapshot(),
             "budget_remaining": int(budget_remaining),
@@ -216,6 +231,8 @@ class SMCIsland:
         self._registry = {p.id: p for p in registry}
         if len(self._registry) != len(registry):
             raise ValueError("checkpoint registry contains duplicate particle IDs")
+        self._failure_memory = {
+            k: list(v) for k, v in state.get("failure_memory", {}).items()}
         self.archive = CandidateArchive.from_snapshot(state["archive"])
         self.ledger = BudgetLedger.from_snapshot(state["ledger"])
         best_id = state.get("best_id")
@@ -252,6 +269,83 @@ class SMCIsland:
             if self.best is None or p.search_score > (self.best.search_score or -np.inf):
                 self.best = p
 
+    # ---- 失败探索记忆（默认关；被拒子代 b+c 摘要按父代累积并注入下一轮 prompt）----
+    @staticmethod
+    def _reward_component_names(code: str) -> set:
+        """best-effort 抽取 reward 分量名 = 代码里所有字符串键 dict 的键并集（AST，鲁棒）。
+
+        用于父↔子「分量级」差异(b)：diff 抵消公共键、只暴露新增/删除的分量名；偶发无关 dict
+        造成的噪声在 diff 后基本对消。解析失败（语法错/无效子代）→ 空集。
+        """
+        try:
+            tree = ast.parse(code)
+        except (SyntaxError, ValueError):
+            return set()
+        names: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for knode in node.keys:
+                    if isinstance(knode, ast.Constant) and isinstance(knode.value, str):
+                        names.add(knode.value)
+        return names
+
+    def _summarize_failure(self, parent_code: str, child_code: str,
+                           parent_score: Optional[float],
+                           child_score: Optional[float]) -> str:
+        """一句话 b+c 摘要：分量增减(b) + ΔJ 结果(c)。"""
+        p = self._reward_component_names(parent_code)
+        c = self._reward_component_names(child_code)
+        added = sorted(c - p)
+        removed = sorted(p - c)
+        parts: list[str] = []
+        if added:
+            parts.append(f"added components {{{', '.join(added[:4])}}}")
+        if removed:
+            parts.append(f"removed components {{{', '.join(removed[:4])}}}")
+        if not parts:
+            parts.append("only tuned parameters/weights (no component added or removed)")
+        ps = f"{parent_score:.4f}" if parent_score is not None else "NA"
+        cs = f"{child_score:.4f}" if child_score is not None else "invalid"
+        tail = (f" (delta {child_score - parent_score:+.4f})"
+                if (parent_score is not None and child_score is not None) else "")
+        return f"{'; '.join(parts)} -> J {ps}->{cs}{tail}"
+
+    def _failure_block(self, state_origin_id: Optional[str]) -> str:
+        """把某父代最近 k 条失败摘要格式化为可插入 prompt 的英文块；关闭/无料 → 空串。"""
+        if not self.cfg.failure_memory_enabled or not state_origin_id:
+            return ""
+        mem = self._failure_memory.get(state_origin_id, [])
+        if not mem:
+            return ""
+        lines = "\n".join(f"    - {s}" for s in mem[-self.cfg.failure_memory_k:])
+        return ("\nPreviously tried edits from THIS reward that were REJECTED because they "
+                "made performance worse. Do NOT repeat these directions; explore a different "
+                "reward component or shaping instead:\n" + lines + "\n")
+
+    def _augment_feedback(self, clone: RewardParticle) -> str:
+        """父代 feedback 尾追失败记忆块。关闭时逐字节等于原 feedback → determinism 不破。"""
+        fb = clone.eval.feedback
+        if not self.cfg.failure_memory_enabled:
+            return fb
+        return fb + self._failure_block(clone.metadata.get("state_origin_id"))
+
+    def _record_failure(self, clone: RewardParticle, child: RewardParticle,
+                        round_idx: int) -> None:
+        """被拒子代（valid 但更差）→ 按父代 state_origin_id 记 b+c 摘要，capped 最近 k。"""
+        if not self.cfg.failure_memory_enabled:
+            return
+        if not (child.valid and child.search_score is not None):
+            return  # 无效子代由 traceback-repair 处理，不进「避坑」记忆（代码可能本身是坏的）
+        key = clone.metadata.get("state_origin_id") or clone.id
+        summary = self._summarize_failure(
+            clone.reward_code, child.reward_code, clone.search_score, child.search_score)
+        lst = self._failure_memory.setdefault(key, [])
+        lst.append(summary)
+        if len(lst) > self.cfg.failure_memory_k:
+            del lst[:-self.cfg.failure_memory_k]     # 只留最近 k 条
+        self.log.log("failure_memory_record", parent=key, child=child.id,
+                     stage=round_idx, summary=summary, n_mem=len(lst))
+
     def _reflect_many(self, items: list[tuple[str, str]]) -> list[Optional[str]]:
         """并发反思（真实 proposer 有 reflect_batch）；否则串行兜底（Fake/测试保持确定性）。"""
         if hasattr(self.proposer, "reflect_batch"):
@@ -269,15 +363,15 @@ class SMCIsland:
         """
         ac = self.cfg.action_cfg
         if ac is None or ac.mode == "generic":
-            codes = self._reflect_many([(c.reward_code, c.eval.feedback) for c in current])
+            codes = self._reflect_many([(c.reward_code, self._augment_feedback(c)) for c in current])
             return [(code, None, None) for code in codes]
         acts = assign_actions(len(current), ac.enabled, ac.enabled_weights())
         if hasattr(self.proposer, "propose_batch"):
-            items = [(c.reward_code, c.eval.feedback, a, self._action_context(c, a))
+            items = [(c.reward_code, self._augment_feedback(c), a, self._action_context(c, a))
                      for c, a in zip(current, acts)]
             pairs = self.proposer.propose_batch(items)
         else:  # 兜底：老式 proposer 无 propose_batch → reflect（丢失 action 指令，仍可跑）
-            pairs = [(self.proposer.reflect(c.reward_code, c.eval.feedback), None)
+            pairs = [(self.proposer.reflect(c.reward_code, self._augment_feedback(c)), None)
                      for c in current]
         return [(code, act, thought) for (code, thought), act in zip(pairs, acts)]
 
@@ -625,6 +719,9 @@ class SMCIsland:
                 )
                 child.metadata["state_origin_id"] = child.id
                 next_population[int(idx[i])] = child
+            else:
+                # 被拒 → 回退父代；把这次失败探索记到父代 state_origin_id，供下一轮避坑。
+                self._record_failure(current[i], child, round_idx)
 
         # Γ_t: retain repeated resampling indices because each occurrence received
         # an independent LLM-modification resource in this stage.
