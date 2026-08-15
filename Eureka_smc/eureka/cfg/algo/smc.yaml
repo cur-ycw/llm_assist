@@ -3,7 +3,7 @@
 #
 # 首版冻结：每轮势函数 U_t=当前原始 search_score J_t，先验权重 W_t=Uniform(N)。
 # rESS 控制器在这个均匀先验上重加权；W_t 均匀不等于父代采样分布 q_t 均匀。
-# Isaac Gym: B=16+8×8=80；Bi-DexHands: B=64+7×64=512。
+# Isaac Gym: B=8+9×8=80；Bi-DexHands: B=64+7×64=512。
 # 每个环境族的初始化批次和 mutation stage 都按其 children/population 配置完整并行。
 # 物理 GPU 排布沿用原 Eureka set_freest_gpu，不属于 SMC 预算协议。
 
@@ -11,11 +11,11 @@ environment_family: isaac_gym
 
 budget_protocols:
   isaac_gym:
-    n_particles: 16
-    init_budget: 16
+    n_particles: 8
+    init_budget: 8
     children_per_round: 8
-    mutation_rounds: 8
-    mutation_budget: 64
+    mutation_rounds: 9
+    mutation_budget: 72
     budget: 80
     k_min: 1
   bidex:
@@ -47,10 +47,10 @@ max_same_repair: 3           # 同一种子连修失败多少次后改抽全新�
 max_mutation_repair: 8       # 修改轮无效子代 traceback-repair 最大波数（RF-Agent 式；0=关。无效子代出现时才触发，全 valid 轮零开销）
 migration_enabled: false     # 粒子迁移仅 source_compat 开启
 
-# ---- 接受容忍度收紧（消融开关，默认精确 no-op，主表/recaliber 口径不受影响）----
+# ---- 接受容忍度锐度 β（2026-08-15 起并入默认口径：init8/β=5 新 SMC 配置）----
 # 现状接受核 p=sigmoid(alpha·delta/span) 在孤峰/宽 span 地形上对"改差子代"过于宽容
 # （中段差满一个 span 仍 ~8% 溜进去）。β 独立压低容忍度，且不动 SMC 重采样温度。
-accept_sharpness: 1.0        # β：接受判定专用锐度 z=β·alpha·delta/span。1.0=现状；消融取 5（差1.5分即基本不接受，近平局仍探索）
+accept_sharpness: 5.0        # β：接受判定专用锐度 z=β·alpha·delta/span。5=差1.5分即基本不接受，近平局仍探索（旧默认=1.0）。
 
 # RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5），与父代分配层正交。
 # mode=generic（默认）：单一 eureka_reflection 通用反思。
