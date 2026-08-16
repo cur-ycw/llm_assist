@@ -52,12 +52,13 @@ migration_enabled: false     # 粒子迁移仅 source_compat 开启
 # （中段差满一个 span 仍 ~8% 溜进去）。β 独立压低容忍度，且不动 SMC 重采样温度。
 accept_sharpness: 5.0        # β：接受判定专用锐度 z=β·alpha·delta/span。5=差1.5分即基本不接受，近平局仍探索（旧默认=1.0）。
 
-# ---- 失败探索记忆（消融开关，默认关=精确 no-op，主表/recaliber 口径不受影响）----
+# ---- 失败探索记忆（2026-08-16 起并入默认口径：默认 enabled=true）----
 # 被拒子代（valid 但更差）按父代 state_origin_id 记 b+c 摘要（分量增减 + ΔJ）；下一轮从同一
 # 父代变异时把摘要插进 prompt，令 LLM 避开已试过的失败方向（正经验=当前父代本身，不另记）。
-# enabled=false 时不记录、不注入，feedback 逐字节不变 → rng/determinism 与主表一致。
+# 动机：humanoid/franka 迭代诊断显示搜索早锁死、变异从卡住父代反复拐进同一坑 → 用失败记忆推离。
+# 关掉（CLI 覆盖 algo.failure_memory.enabled=false）时不记录、不注入，feedback 逐字节不变 → 与旧口径一致。
 failure_memory:
-  enabled: false             # 默认关；消融时 CLI 覆盖 algo.failure_memory.enabled=true
+  enabled: true              # 并入默认口径；作对照关掉用 CLI 覆盖 algo.failure_memory.enabled=false
   k: 3                       # 每个父代最多保留最近 k 条失败摘要（防 prompt 膨胀）
 
 # RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5），与父代分配层正交。
