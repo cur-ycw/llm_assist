@@ -77,6 +77,12 @@ class SMCIslandConfig:
     # feedback 字符串逐字节不变 → rng 消费与 determinism 不受影响。
     failure_memory_enabled: bool = False
     failure_memory_k: int = 3       # 每个父代最多保留最近 k 条失败摘要（防 prompt 膨胀）
+    # ---- 纯贪婪接受消融（默认精确 no-op；仅消融时开启）----
+    # 开启时接受判定退化为 delta>0 硬阈值：从不接受劣化子代，也不消耗 rng（确定性）。
+    # 目的：隔离"接受劣化子代(accept-worse)"这一 SMC 特性，对照贪婪爬山是否更优。
+    # 关闭时（默认）走原 sigmoid 接受核，feedback / rng 消费逐字节不变 → 与旧口径一致。
+    # 注意：本开关仅关掉接受劣化，rESS 重采样仍在 → 贪婪-SMC ≠ Eureka 单链纯贪婪。
+    greedy_accept: bool = False
 
     def __post_init__(self) -> None:
         """校验初始化池、每轮修改资源和总候选预算的关系。"""
@@ -166,6 +172,7 @@ class SMCIsland:
         # 失败记忆开关默认关时精确 no-op：排除出指纹，令旧 checkpoint 在加了该字段的新代码下仍可续跑。
         payload.pop("failure_memory_enabled", None)
         payload.pop("failure_memory_k", None)
+        payload.pop("greedy_accept", None)
         encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -760,7 +767,11 @@ class SMCIsland:
         delta = child.search_score - (current.search_score or 0.0)
         improved = delta > 0.0
         normalized_delta = delta / potential_span if potential_span > 0.0 else 0.0
-        if improved:
+        if self.cfg.greedy_accept:
+            # 纯贪婪消融：仅按 delta>0 硬接受，从不接受劣化子代，且不消耗 rng（确定性）。
+            accept = improved
+            p_accept = 1.0 if improved else 0.0
+        elif improved:
             accept = True
             p_accept = 1.0
         elif potential_span == 0.0:
@@ -776,6 +787,7 @@ class SMCIsland:
                      delta=delta, normalized_delta=normalized_delta, alpha=alpha_t,
                      potential_span=potential_span,
                      accept_sharpness=self.cfg.accept_sharpness,
+                     greedy_accept=self.cfg.greedy_accept,
                      lambda_equivalent=(alpha_t / potential_span if potential_span > 0.0 else 0.0),
                      p_accept=p_accept, improved=improved, accepted=accept)
         return child if accept else current

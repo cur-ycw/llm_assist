@@ -61,6 +61,12 @@ failure_memory:
   enabled: true              # 并入默认口径；作对照关掉用 CLI 覆盖 algo.failure_memory.enabled=false
   k: 3                       # 每个父代最多保留最近 k 条失败摘要（防 prompt 膨胀）
 
+# ---- 纯贪婪接受消融（默认关=精确 no-op）----
+# 开启（CLI 覆盖 algo.greedy_accept=true）时接受判定退化为 delta>0 硬阈值：从不接受劣化子代、
+# 不消耗 rng；用来隔离"接受劣化子代(accept-worse)"这一 SMC 特性，对照贪婪爬山是否更优。
+# 注意：仅关掉接受劣化，rESS 重采样仍在 → 贪婪-SMC ≠ Eureka 单链纯贪婪。关掉时逐字节回到 sigmoid 接受核。
+greedy_accept: false
+
 # RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5），与父代分配层正交。
 # mode=generic（默认）：单一 eureka_reflection 通用反思。
 # mode=rf：按 enabled 中各 action 对应 rf_ratio 权重确定性派发。历史料由 island 确定性从注册表
