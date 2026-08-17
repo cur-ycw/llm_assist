@@ -253,7 +253,8 @@ def main(cfg):
             accept_sharpness=float(algo.get("accept_sharpness", 1.0)),
             failure_memory_enabled=bool(algo.get("failure_memory", {}).get("enabled", False)),
             failure_memory_k=int(algo.get("failure_memory", {}).get("k", 3)),
-            greedy_accept=bool(algo.get("greedy_accept", False))),
+            greedy_accept=bool(algo.get("greedy_accept", False)),
+            accept_all=bool(algo.get("accept_all", False))),
         proposer, evaluator,
         event_log,
         artifact_root=workspace_dir / "candidates")

@@ -83,6 +83,12 @@ class SMCIslandConfig:
     # 关闭时（默认）走原 sigmoid 接受核，feedback / rng 消费逐字节不变 → 与旧口径一致。
     # 注意：本开关仅关掉接受劣化，rESS 重采样仍在 → 贪婪-SMC ≠ Eureka 单链纯贪婪。
     greedy_accept: bool = False
+    # ---- 无条件全接受消融（默认精确 no-op；仅消融时开启）----
+    # 开启时接受判定退化为"恒接受":每轮子代无条件顶替父代槽位(不管更好/更差)、不消耗 rng。
+    # 目的:把接受层的选择彻底拿掉,只剩 rESS 重采样做选择 → 最大漂移/最大探索,对照 greedy(纯利用)。
+    # 注意:冠军仍是 archive 全局最优(与接受策略无关),本开关只改"下一轮从哪播种"的轨迹。
+    # 与 greedy_accept 互斥(不可同真)。关闭时(默认)走原 sigmoid 接受核,逐字节不变。
+    accept_all: bool = False
 
     def __post_init__(self) -> None:
         """校验初始化池、每轮修改资源和总候选预算的关系。"""
@@ -130,6 +136,8 @@ class SMCIslandConfig:
             raise ValueError("accept_sharpness must be finite and positive")
         if self.failure_memory_k < 1:
             raise ValueError("failure_memory_k must be >= 1")
+        if self.greedy_accept and self.accept_all:
+            raise ValueError("greedy_accept and accept_all are mutually exclusive")
 
 
 @dataclass
@@ -173,6 +181,7 @@ class SMCIsland:
         payload.pop("failure_memory_enabled", None)
         payload.pop("failure_memory_k", None)
         payload.pop("greedy_accept", None)
+        payload.pop("accept_all", None)
         encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -767,7 +776,11 @@ class SMCIsland:
         delta = child.search_score - (current.search_score or 0.0)
         improved = delta > 0.0
         normalized_delta = delta / potential_span if potential_span > 0.0 else 0.0
-        if self.cfg.greedy_accept:
+        if self.cfg.accept_all:
+            # 无条件全接受消融:每轮子代恒顶替父代(不管好坏),不消耗 rng(确定性)。
+            accept = True
+            p_accept = 1.0
+        elif self.cfg.greedy_accept:
             # 纯贪婪消融：仅按 delta>0 硬接受，从不接受劣化子代，且不消耗 rng（确定性）。
             accept = improved
             p_accept = 1.0 if improved else 0.0
@@ -788,6 +801,7 @@ class SMCIsland:
                      potential_span=potential_span,
                      accept_sharpness=self.cfg.accept_sharpness,
                      greedy_accept=self.cfg.greedy_accept,
+                     accept_all=self.cfg.accept_all,
                      lambda_equivalent=(alpha_t / potential_span if potential_span > 0.0 else 0.0),
                      p_accept=p_accept, improved=improved, accepted=accept)
         return child if accept else current

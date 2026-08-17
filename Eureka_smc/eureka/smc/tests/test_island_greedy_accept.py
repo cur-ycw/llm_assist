@@ -24,10 +24,11 @@ def _particle(pid: str, score: float) -> RewardParticle:
         eval=EvalRecord(search_score=score, valid=True, executable=True))
 
 
-def _island(greedy: bool, tmp_path, *, accept_sharpness: float = 5.0, seed: int = 0) -> SMCIsland:
+def _island(greedy: bool, tmp_path, *, accept_all: bool = False,
+            accept_sharpness: float = 5.0, seed: int = 0) -> SMCIsland:
     cfg = SMCIslandConfig(
         n_particles=4, children_per_round=4, budget=20, k_min=1, seed=seed,
-        accept_sharpness=accept_sharpness, greedy_accept=greedy)
+        accept_sharpness=accept_sharpness, greedy_accept=greedy, accept_all=accept_all)
     score_cfg = ScoreConfig(lower=0.0, upper=1.0)
     return SMCIsland(
         cfg,
@@ -81,3 +82,25 @@ def test_greedy_off_can_accept_worse_child_over_trials(tmp_path):
         isl._sigmoid_accept(cur, worse, alpha_t=1.0, potential_span=1.0, round_idx=3).id == "worse"
         for _ in range(200))
     assert accepted > 0
+
+
+def test_accept_all_takes_every_child(tmp_path):
+    """无条件全接受：改好 / 改差 / 平局的子代一律被接受（返回 child），且不消耗 rng。"""
+    isl = _island(greedy=False, tmp_path=tmp_path, accept_all=True)
+    cur = _particle("cur", 1.0)
+    better = _particle("better", 1.5)
+    worse = _particle("worse", 0.3)
+    tie = _particle("tie", 1.0)
+    before = isl.rng.bit_generator.state
+    for child, cid in ((better, "better"), (worse, "worse"), (tie, "tie")):
+        assert isl._sigmoid_accept(cur, child, alpha_t=1.0, potential_span=1.0, round_idx=3).id == cid
+    after = isl.rng.bit_generator.state
+    assert before == after   # 恒接受、确定性、不掷币
+
+
+def test_greedy_and_accept_all_mutually_exclusive():
+    """两个消融开关不可同真：SMCIslandConfig 构造时即报错。"""
+    import pytest
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SMCIslandConfig(n_particles=4, children_per_round=4, budget=20, k_min=1,
+                        greedy_accept=True, accept_all=True)

@@ -67,6 +67,12 @@ failure_memory:
 # 注意：仅关掉接受劣化，rESS 重采样仍在 → 贪婪-SMC ≠ Eureka 单链纯贪婪。关掉时逐字节回到 sigmoid 接受核。
 greedy_accept: false
 
+# ---- 无条件全接受消融（默认关=精确 no-op；与 greedy_accept 互斥）----
+# 开启（CLI 覆盖 algo.accept_all=true）时接受判定退化为"恒接受":每轮子代无条件顶替父代(不管好坏)、
+# 不消耗 rng。把接受层选择彻底拿掉,只剩 rESS 重采样做选择 → 最大漂移/探索,对照 greedy(纯利用)。
+# 冠军仍是 archive 全局最优(与接受策略无关),本开关只改"下一轮从哪播种"的轨迹。关掉时逐字节回 sigmoid。
+accept_all: false
+
 # RF-Agent 奖励专用 proposal action 路由（计划 §6.4.1、§6.5），与父代分配层正交。
 # mode=generic（默认）：单一 eureka_reflection 通用反思。
 # mode=rf：按 enabled 中各 action 对应 rf_ratio 权重确定性派发。历史料由 island 确定性从注册表
