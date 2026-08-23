@@ -21,6 +21,10 @@ test_policy_train_iterations: null # test 迭代(RF-Agent test_max_iterations);n
 num_eval: 5 # number of evaluation episodes to run for the final reward
 capture_video: False # whether to capture policy rollout videos
 
+# 并发/显存治理开关(默认 null = 精确 no-op,保持原版一次性全并发 + task 默认 num_envs)
+max_parallel_train: null # 同时在跑的 train 子进程上限;null=不封顶(原版行为)。大 sample(如512预算)在显存受限机器上必须设,否则 OOM
+num_envs: null # 覆盖 task cfg 的 numEnvs;null=用 task 默认(bidex=2048)。降低可省显存+提并发,偏离标准口径需注明
+
 # Weights and Biases
 use_wandb: False # whether to use wandb for logging
 wandb_username: "" # wandb username if logging with wandb

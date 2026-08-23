@@ -69,8 +69,25 @@ def main(cfg):
     test_iters = int(test_iters) if test_iters is not None else search_iters
     logging.info(f"Iterations (RF-Agent standard): search={search_iters}, test={test_iters}")
 
+    # 并发/显存治理(默认 null = 原版行为,精确 no-op)。
+    max_parallel_train = cfg.get("max_parallel_train", None)
+    max_parallel_train = int(max_parallel_train) if max_parallel_train else None
+    num_envs_override = cfg.get("num_envs", None)
+    extra_train_args = [f'num_envs={int(num_envs_override)}'] if num_envs_override else []
+    if max_parallel_train:
+        logging.info(f"Parallel train cap: {max_parallel_train} in-flight subprocesses")
+    if num_envs_override:
+        logging.info(f"num_envs override: {int(num_envs_override)} (task default otherwise)")
+
+    def _await_train_slot(runs):
+        # 阻塞直到在跑的 train 子进程数 < 上限;null 时立即返回(no-op)。
+        if not max_parallel_train:
+            return
+        while sum(1 for p in runs if p.poll() is None) >= max_parallel_train:
+            time.sleep(2)
+
     env_name = cfg.env.env_name.lower()
-    env_parent = 'isaac' if f'{env_name}.py' in os.listdir(f'{EUREKA_ROOT_DIR}/envs/isaac') else 'dexterity'
+    env_parent = 'isaac' if f'{env_name}.py' in os.listdir(f'{EUREKA_ROOT_DIR}/envs/isaac') else 'bidex'
     task_file = f'{EUREKA_ROOT_DIR}/envs/{env_parent}/{env_name}.py'
     task_obs_file = f'{EUREKA_ROOT_DIR}/envs/{env_parent}/{env_name}_obs.py'
     shutil.copy(task_obs_file, f"env_init_obs.py")
@@ -218,17 +235,18 @@ def main(cfg):
             shutil.copy(output_file, f"env_iter{iter}_response{response_id}.py")
 
             # Find the freest GPU to run GPU-accelerated RL
+            _await_train_slot(rl_runs)
             set_freest_gpu()
-            
+
             # Execute the python file with flags
             rl_filepath = f"env_iter{iter}_response{response_id}.txt"
             with open(rl_filepath, 'w') as f:
-                process = subprocess.Popen(['python', '-u', f'{ISAAC_ROOT_DIR}/train.py',  
+                process = subprocess.Popen(['python', '-u', f'{ISAAC_ROOT_DIR}/train.py',
                                             'hydra/output=subprocess',
                                             f'task={task}{suffix}', f'wandb_activate={cfg.use_wandb}',
                                             f'wandb_entity={cfg.wandb_username}', f'wandb_project={cfg.wandb_project}',
                                             f'headless={not cfg.capture_video}', f'capture_video={cfg.capture_video}', 'force_render=False',
-                                            f'max_iterations={search_iters}'],
+                                            f'max_iterations={search_iters}'] + extra_train_args,
                                             stdout=f, stderr=f)
             block_until_training(rl_filepath, log_status=True, iter_num=iter, response_id=response_id)
             rl_runs.append(process)
@@ -384,18 +402,19 @@ def main(cfg):
     
     eval_runs = []
     for i in range(cfg.num_eval):
+        _await_train_slot(eval_runs)
         set_freest_gpu()
-        
+
         # Execute the python file with flags
         rl_filepath = f"reward_code_eval{i}.txt"
         with open(rl_filepath, 'w') as f:
-            process = subprocess.Popen(['python', '-u', f'{ISAAC_ROOT_DIR}/train.py',  
+            process = subprocess.Popen(['python', '-u', f'{ISAAC_ROOT_DIR}/train.py',
                                         'hydra/output=subprocess',
                                         f'task={task}{suffix}', f'wandb_activate={cfg.use_wandb}',
                                         f'wandb_entity={cfg.wandb_username}', f'wandb_project={cfg.wandb_project}',
                                         f'headless={not cfg.capture_video}', f'capture_video={cfg.capture_video}', 'force_render=False', f'seed={i}',
                                         f'max_iterations={test_iters}',
-                                        ],
+                                        ] + extra_train_args,
                                         stdout=f, stderr=f)
 
         block_until_training(rl_filepath)
